@@ -1,0 +1,991 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+<title>Enterprise Active Directory Operational Dashboard</title>
+
+<style>
+    body {
+        margin: 0;
+        padding: 0;
+        font-family: "Segoe UI", Arial, sans-serif;
+        background: #f5f7fb;
+        color: #1f2937;
+    }
+
+    .page-generated {
+        width: 950px;
+        margin: 18px auto 0 auto;
+        text-align: right;
+        font-size: 13px;
+        color: #64748b;
+    }
+
+    .container {
+        width: 92%;
+        margin: 20px auto 30px auto;
+    }
+
+    .header {
+        max-width: 950px;
+        margin: 0 auto 18px auto;
+        background: linear-gradient(90deg, #dbeafe, #eff6ff);
+        padding: 22px;
+        text-align: center;
+        border-radius: 14px;
+        border: 1px solid #bfdbfe;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+
+    .header-title {
+        font-size: 30px;
+        font-weight: 800;
+        color: #0f172a;
+        letter-spacing: 0.2px;
+    }
+
+    .config-section {
+        max-width: 950px;
+        margin: 0 auto 28px auto;
+        background: linear-gradient(135deg, #eef4ff, #f6f9ff);
+        border: 1px solid #dbe7ff;
+        border-radius: 18px;
+        padding: 22px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+    }
+
+    .config-title {
+        font-size: 20px;
+        font-weight: 800;
+        color: #111827;
+        border-left: 5px solid #2563eb;
+        padding-left: 10px;
+        margin-bottom: 20px;
+    }
+
+    .config-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+    }
+
+    .config-tile {
+        position: relative;
+        background: linear-gradient(180deg,#f8fbff,#eef5ff);
+        border: 1px solid #e5e7eb;
+        border-left: 5px solid #2563eb;
+        border-radius: 12px;
+        padding: 10px 16px;
+        min-height: 75px;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+        overflow: visible;
+    }
+
+    .config-tile:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 14px 30px rgba(15, 23, 42, 0.14);
+        z-index: 9999;
+    }
+
+    .config-label {
+        font-size: 13px;
+        color: #64748b;
+        margin-bottom: 8px;
+        font-weight: 600;
+    }
+
+    .config-value {
+        font-size: 20px;
+        color: #111827;
+        font-weight: 800;
+        word-break: break-word;
+    }
+
+    .config-value-small {
+        font-size: 15px;
+        color: #111827;
+        font-weight: 800;
+        line-height: 1.35;
+        word-break: break-word;
+    }
+
+    .config-footer {
+        font-size: 12px;
+        color: #94a3b8;
+        margin-top: 8px;
+    }
+
+    .dashboard {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 22px;
+        max-width: 950px;
+        margin: 0 auto;
+        overflow: visible;
+    }
+
+    .tile {
+        position: relative;
+        background: #ffffff;
+        color: #111827;
+        border: 1px solid #e5e7eb;
+        min-height: 118px;
+        border-radius: 18px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 18px;
+        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        overflow: visible;
+    }
+
+    .tile:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 14px 30px rgba(15, 23, 42, 0.14);
+        border-color: #93c5fd;
+        z-index: 9999;
+    }
+
+    .tile-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .tile-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #475569;
+        line-height: 1.35;
+    }
+
+    .tile-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .tile-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        background: #eff6ff;
+        color: #2563eb;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        font-weight: 700;
+    }
+
+    .export-btn {
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        border: 1px solid #bfdbfe;
+        background: #eff6ff;
+        color: #2563eb;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .export-btn:hover {
+        background: #dbeafe;
+        border-color: #93c5fd;
+    }
+
+    .section-export-btn-inline {
+        float: right;
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.55);
+        background: rgba(255,255,255,0.16);
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+        margin-top: -3px;
+    }
+
+    .section-export-btn-inline:hover {
+        background: rgba(255,255,255,0.28);
+        border-color: #ffffff;
+    }
+
+    .tile-value {
+        font-size: 34px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1;
+    }
+
+    .tile-value-small {
+        font-size: 17px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.35;
+    }
+
+    .tile-footer {
+        font-size: 12px;
+        color: #94a3b8;
+        margin-top: 8px;
+    }
+
+    .health {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 3px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+    }
+
+    .health-good {
+        background: #dcfce7;
+        color: #166534;
+    }
+
+    .health-warning {
+        background: #fef3c7;
+        color: #92400e;
+    }
+
+    .health-unknown {
+        background: #e5e7eb;
+        color: #374151;
+    }
+
+    .tile.accent-blue {
+        border-top: 4px solid #3b82f6;
+    }
+
+    .tile.accent-green {
+        border-top: 4px solid #22c55e;
+    }
+
+    .tile.accent-orange {
+        border-top: 4px solid #f59e0b;
+    }
+
+    .tile.accent-purple {
+        border-top: 4px solid #8b5cf6;
+    }
+
+    .tile.accent-red {
+        border-top: 4px solid #ef4444;
+    }
+
+    .tile.accent-cyan {
+        border-top: 4px solid #06b6d4;
+    }
+
+    .tooltip-box {
+        display: none;
+        position: absolute;
+        left: 20px;
+        top: 112px;
+        width: 430px;
+        max-height: 360px;
+        overflow-y: auto;
+        background: #0f172a;
+        color: #f8fafc;
+        border-radius: 12px;
+        padding: 14px 16px;
+        font-size: 13px;
+        line-height: 1.6;
+        z-index: 99999;
+        box-shadow: 0 16px 36px rgba(15, 23, 42, 0.35);
+    }
+
+    .tile:hover .tooltip-box,
+    .config-tile:hover .tooltip-box {
+        display: block;
+    }
+
+    .tooltip-line {
+        padding: 5px 0;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    .tooltip-line:last-child {
+        border-bottom: none;
+    }
+
+    .tooltip-line b {
+        display: block;
+        color: #ffffff;
+        font-weight: 700;
+    }
+
+    .tooltip-line span {
+        display: block;
+        color: #cbd5e1;
+        font-size: 12px;
+    }
+
+    .section-title {
+        max-width: 950px;
+        margin: 38px auto 15px auto;
+        font-size: 20px;
+        font-weight: 700;
+        color: #111827;
+        border-left: 5px solid #2563eb;
+        padding-left: 10px;
+        position: relative;
+    }
+
+    table {
+        width: 950px;
+        margin: 0 auto 25px auto;
+        border-collapse: collapse;
+        background: white;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+    }
+
+    th {
+        background: #2563eb;
+        color: white;
+        padding: 11px;
+        text-align: left;
+        font-size: 14px;
+    }
+
+    td {
+        padding: 10px;
+        border-bottom: 1px solid #e5e7eb;
+        font-size: 13px;
+    }
+
+    tr:hover {
+        background: #f8fafc;
+    }
+
+    .footer {
+        margin-top: 35px;
+        text-align: center;
+        font-size: 12px;
+        color: #64748b;
+    }
+
+    @media only screen and (max-width: 900px) {
+        .dashboard,
+        .config-grid {
+            grid-template-columns: 1fr;
+        }
+
+        table,
+        .page-generated {
+            width: 100%;
+        }
+
+        .header-title {
+            font-size: 24px;
+        }
+
+        .tooltip-box {
+            width: 280px;
+        }
+    }
+</style>
+</head>
+
+<body>
+
+<div class="page-generated">Generated On: 19-May-2026 12:22:15 AM</div>
+
+<div class="container">
+
+    <div class="header">
+        <div class="header-title">Enterprise Active Directory Operational Dashboard</div>
+    </div>
+
+    <div class="config-section">
+        <div class="config-title">Forest & Domain Configuration</div>
+
+        <div class="config-grid">
+
+            <div class="config-tile">
+                <div class="config-label">Forest Root Domain</div>
+                <div class="config-value">azgarlabs.com</div>
+                <div class="config-footer">Forest root domain</div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">Domains</div>
+                <div class="config-value">1</div>
+                <div class="config-footer">Hover for details</div>
+                <div class="tooltip-box"><div class='tooltip-line'><b>azgarlabs.com</b><span>Single Domain Forest</span></div></div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">NetBIOS Name</div>
+                <div class="config-value">AZGARLABS</div>
+                <div class="config-footer">AD NetBIOS namespace</div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">UPN Domain Suffixes</div>
+                <div class="config-value-small">azurebuddy.in</div>
+                <div class="config-footer">Additional UPN suffixes configured in forest</div>
+                <div class="tooltip-box"><div class='tooltip-line'><b>azurebuddy.in</b><span>Configured UPN suffix</span></div></div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">Forest Functional Level</div>
+                <div class="config-value">Windows2016Forest</div>
+                <div class="config-footer">Forest-wide functional mode</div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">Domain Functional Level</div>
+                <div class="config-value">Windows2016Domain</div>
+                <div class="config-footer">Current domain functional mode</div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">AD Recycle Bin Status</div>
+                <div class="config-value">Disabled</div>
+                <span class="health health-warning">Warning</span>
+                <div class="config-footer">Deleted object recovery capability</div>
+            </div>
+
+            <div class="config-tile">
+                <div class="config-label">Tombstone Lifetime</div>
+                <div class="config-value">180 Days</div>
+                <div class="config-footer">Deleted object lifetime</div>
+            </div>
+
+        </div>
+    </div>
+
+    <div class="section-title">Active Directory Operations</div>
+
+    <div class="dashboard">
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">Domain Controllers</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export DC ICMP Status" onclick="downloadCsv('DC_ICMP_Status.csv', dcPingCsv)">⇩</button>
+                    <div class="tile-icon">DC</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">2</div>
+                <span class="health health-warning">Warning</span>
+                <div class="tile-footer">1 DC(s) not responding to ICMP</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>vmdc01.azgarlabs.com</b><span>Reachable | IP: 192.168.224.128 | Site: Default-First-Site-Name</span></div><div class='tooltip-line'><b>vmdc02.azgarlabs.com</b><span>Not Responding | IP: 192.168.224.129 | Site: Default-First-Site-Name</span></div></div>
+        </div>
+
+        <div class="tile accent-cyan">
+            <div class="tile-top">
+                <div class="tile-title">FSMO Role Holders</div>
+                <div class="tile-icon">FS</div>
+            </div>
+            <div>
+                <div class="tile-value">1</div>
+                <div class="tile-footer">Hover to view role holder names</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>Schema Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>Domain Naming Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>PDC Emulator</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>RID Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>Infrastructure Master</b><span>vmdc01.azgarlabs.com</span></div></div>
+        </div>
+
+        <div class="tile accent-green">
+            <div class="tile-top">
+                <div class="tile-title">Default Domain Password Policy</div>
+                <div class="tile-icon">PW</div>
+            </div>
+            <div>
+                <div class="tile-value-small">Min 7 | Max 42 Days</div>
+                <div class="tile-footer">Hover to view full policy</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>Minimum Password Length</b><span>7</span></div>
+<div class='tooltip-line'><b>Maximum Password Age</b><span>42 Days</span></div>
+<div class='tooltip-line'><b>Minimum Password Age</b><span>1 Days</span></div>
+<div class='tooltip-line'><b>Password History Count</b><span>24</span></div>
+<div class='tooltip-line'><b>Complexity Enabled</b><span>True</span></div>
+<div class='tooltip-line'><b>Reversible Encryption Enabled</b><span>False</span></div>
+<div class='tooltip-line'><b>Lockout Threshold</b><span>4</span></div>
+<div class='tooltip-line'><b>Lockout Duration</b><span>0 Days</span></div>
+<div class='tooltip-line'><b>Lockout Observation Window</b><span>0 Days</span></div></div>
+        </div>
+
+        <div class="tile accent-green">
+            <div class="tile-top">
+                <div class="tile-title">AD Sites</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export AD Sites" onclick="downloadCsv('AD_Sites.csv', adSitesCsv)">⇩</button>
+                    <div class="tile-icon">ST</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">3</div>
+                <div class="tile-footer">Hover to view site names</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>DataCenter-USEast</b><span>Active Directory Site</span></div><div class='tooltip-line'><b>DataCenter-USWest</b><span>Active Directory Site</span></div><div class='tooltip-line'><b>Default-First-Site-Name</b><span>Active Directory Site</span></div></div>
+        </div>
+
+        <div class="tile accent-orange">
+            <div class="tile-top">
+                <div class="tile-title">Sites with No DCs</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export Sites with No DCs" onclick="downloadCsv('Sites_With_No_DCs.csv', sitesWithNoDCsCsv)">⇩</button>
+                    <div class="tile-icon">ND</div>
+            </div>
+        </div>
+     <div>
+        <div class="tile-value">2</div>
+        <span class="health health-warning">Warning</span>
+        <div class="tile-footer">Sites without local domain controllers</div>
+        </div>
+        <div class="tooltip-box"><div class='tooltip-line'><b>DataCenter-USEast</b><span>No domain controller found in this site</span></div><div class='tooltip-line'><b>DataCenter-USWest</b><span>No domain controller found in this site</span></div></div>
+    </div>
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">Subnets</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export AD Subnets" onclick="downloadCsv('AD_Subnets.csv', adSubnetsCsv)">⇩</button>
+                    <div class="tile-icon">SN</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">3</div>
+                <div class="tile-footer">Hover to view subnet to site mapping</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>172.16.0.0/24</b><span>Site: DataCenter-USWest</span></div><div class='tooltip-line'><b>192.168.10.0/24</b><span>Site: DataCenter-USEast</span></div><div class='tooltip-line'><b>192.168.224.0/24</b><span>Site: Default-First-Site-Name</span></div></div>
+        </div>
+
+        <div class="tile accent-red">
+            <div class="tile-top">
+                <div class="tile-title">Domain Admins</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export Domain Admins" onclick="downloadCsv('Domain_Admins.csv', domainAdminsCsv)">⇩</button>
+                    <div class="tile-icon">DA</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">9</div>
+                <div class="tile-footer">Privileged group members</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>admin-da</b><span>admin-da (user)</span></div><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div><div class='tooltip-line'><b>John Doe</b><span>433351 (user)</span></div><div class='tooltip-line'><b>lab admin</b><span>lab-admin (user)</span></div><div class='tooltip-line'><b>Michael Jackson</b><span>433786 (user)</span></div><div class='tooltip-line'><b>qa admin</b><span>admin-qa (user)</span></div><div class='tooltip-line'><b>srv Admin</b><span>serveradmin (user)</span></div><div class='tooltip-line'><b>Test Account</b><span>Test.Account (user)</span></div><div class='tooltip-line'><b>ws admin</b><span>wsadmin (user)</span></div></div>
+        </div>
+
+        <div class="tile accent-purple">
+            <div class="tile-top">
+                <div class="tile-title">Enterprise Admins</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export Enterprise Admins" onclick="downloadCsv('Enterprise_Admins.csv', enterpriseAdminsCsv)">⇩</button>
+                    <div class="tile-icon">EA</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">1</div>
+                <div class="tile-footer">Forest-level privileged members</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div></div>
+        </div>
+
+        <div class="tile accent-orange">
+            <div class="tile-top">
+                <div class="tile-title">Schema Admins</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export Schema Admins" onclick="downloadCsv('Schema_Admins.csv', schemaAdminsCsv)">⇩</button>
+                    <div class="tile-icon">SA</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">2</div>
+                <div class="tile-footer">Schema modification members</div>
+            </div>
+            <div class="tooltip-box"><div class='tooltip-line'><b>admin-da</b><span>admin-da (user)</span></div><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div></div>
+        </div>
+
+        <div class="tile accent-orange">
+            <div class="tile-top">
+                <div class="tile-title">DNS Zones</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">⇩</button>
+                    <div class="tile-icon">DNS</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">13</div>
+                <div class="tile-footer">Total DNS zones</div>
+            </div>
+        </div>
+
+        <div class="tile accent-green">
+            <div class="tile-top">
+                <div class="tile-title">AD Integrated DNS Zones</div>
+                <div class="tile-icon">ADI</div>
+            </div>
+            <div>
+                <div class="tile-value">9</div>
+                <div class="tile-footer">Directory-integrated zones</div>
+            </div>
+        </div>
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">Standalone DNS Zones</div>
+                <div class="tile-icon">STD</div>
+            </div>
+            <div>
+                <div class="tile-value">4</div>
+                <div class="tile-footer">File-backed / non-AD zones</div>
+            </div>
+        </div>
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">GPO Count</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export GPO Inventory" onclick="downloadCsv('GPO_Inventory.csv', gpoCsv)">⇩</button>
+                    <div class="tile-icon">GP</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">5</div>
+                <div class="tile-footer">Group Policy Objects</div>
+            </div>
+        </div>
+
+        <div class="tile accent-orange">
+            <div class="tile-top">
+                <div class="tile-title">Unlinked GPOs</div>
+                <div class="tile-actions">
+                    <button class="export-btn" title="Export Unlinked GPOs" onclick="downloadCsv('Unlinked_GPOs.csv', unlinkedGpoCsv)">⇩</button>
+                    <div class="tile-icon">UL</div>
+                </div>
+            </div>
+            <div>
+                <div class="tile-value">2</div>
+                <div class="tile-footer">No Site / Domain / OU links</div>
+            </div>
+        </div>
+
+        <div class="tile accent-red">
+            <div class="tile-top">
+                <div class="tile-title">Disabled GPOs</div>
+                <div class="tile-icon">DG</div>
+            </div>
+            <div>
+                <div class="tile-value">1</div>
+                <div class="tile-footer">User / Computer settings disabled</div>
+            </div>
+        </div>
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">Total User Objects</div>
+                <div class="tile-icon">U</div>
+            </div>
+            <div>
+                <div class="tile-value">30</div>
+                <div class="tile-footer">All user objects</div>
+            </div>
+        </div>
+
+        <div class="tile accent-green">
+            <div class="tile-top">
+                <div class="tile-title">Active User Objects</div>
+                <div class="tile-icon">AU</div>
+            </div>
+            <div>
+                <div class="tile-value">26</div>
+                <div class="tile-footer">Enabled users</div>
+            </div>
+        </div>
+
+        <div class="tile accent-purple">
+            <div class="tile-top">
+                <div class="tile-title">Disabled User Objects</div>
+                <div class="tile-icon">DU</div>
+            </div>
+            <div>
+                <div class="tile-value">4</div>
+                <div class="tile-footer">Disabled users</div>
+            </div>
+        </div>
+
+        <div class="tile accent-blue">
+            <div class="tile-top">
+                <div class="tile-title">Total Groups</div>
+                <div class="tile-icon">G</div>
+            </div>
+            <div>
+                <div class="tile-value">67</div>
+                <div class="tile-footer">All group objects</div>
+            </div>
+        </div>
+
+        <div class="tile accent-purple">
+            <div class="tile-top">
+                <div class="tile-title">Security Groups</div>
+                <div class="tile-icon">SG</div>
+            </div>
+            <div>
+                <div class="tile-value">60</div>
+                <div class="tile-footer">Security-enabled groups</div>
+            </div>
+        </div>
+
+        <div class="tile accent-orange">
+            <div class="tile-top">
+                <div class="tile-title">Distribution Groups</div>
+                <div class="tile-icon">DG</div>
+            </div>
+            <div>
+                <div class="tile-value">7</div>
+                <div class="tile-footer">Mail distribution groups</div>
+            </div>
+        </div>
+
+        <div class="tile accent-cyan">
+            <div class="tile-top">
+                <div class="tile-title">Total Computer Objects</div>
+                <div class="tile-icon">C</div>
+            </div>
+            <div>
+                <div class="tile-value">8</div>
+                <div class="tile-footer">All computer objects</div>
+            </div>
+        </div>
+
+        <div class="tile accent-green">
+            <div class="tile-top">
+                <div class="tile-title">Active Computer Objects</div>
+                <div class="tile-icon">AC</div>
+            </div>
+            <div>
+                <div class="tile-value">7</div>
+                <div class="tile-footer">Enabled computers</div>
+            </div>
+        </div>
+
+        <div class="tile accent-red">
+            <div class="tile-top">
+                <div class="tile-title">Disabled Computer Objects</div>
+                <div class="tile-icon">DC</div>
+            </div>
+            <div>
+                <div class="tile-value">1</div>
+                <div class="tile-footer">Disabled computers</div>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="section-title">FSMO Role Holders</div>
+
+    <table>
+        <tr>
+            <th>Role</th>
+            <th>Server</th>
+        </tr>
+        <tr>
+            <td>Schema Master</td>
+            <td>vmdc01.azgarlabs.com</td>
+        </tr>
+        <tr>
+            <td>Domain Naming Master</td>
+            <td>vmdc01.azgarlabs.com</td>
+        </tr>
+        <tr>
+            <td>PDC Emulator</td>
+            <td>vmdc01.azgarlabs.com</td>
+        </tr>
+        <tr>
+            <td>RID Master</td>
+            <td>vmdc01.azgarlabs.com</td>
+        </tr>
+        <tr>
+            <td>Infrastructure Master</td>
+            <td>vmdc01.azgarlabs.com</td>
+        </tr>
+    </table>
+
+    <div class="section-title">Domain Controllers</div>
+
+    <table>
+        <tr>
+            <th>Domain Controller</th>
+            <th>IPv4 Address</th>
+            <th>IsGC</th>
+            <th>Operating System</th>
+            <th>
+                Site
+                <button class="section-export-btn-inline" title="Export Domain Controllers" onclick="downloadCsv('Domain_Controllers.csv', domainControllersCsv)">⇩</button>
+            </th>
+        </tr>        <tr>
+            <td>vmdc01.azgarlabs.com</td>
+            <td>192.168.224.128</td>
+            <td>True</td>
+            <td>Windows Server 2019 Datacenter</td>
+            <td>Default-First-Site-Name</td>
+        </tr>        <tr>
+            <td>vmdc02.azgarlabs.com</td>
+            <td>192.168.224.129</td>
+            <td>True</td>
+            <td>Windows Server 2019 Datacenter</td>
+            <td>Default-First-Site-Name</td>
+        </tr>    </table>
+
+    <div class="section-title">Trust Relationships</div>
+
+    <table>
+        <tr>
+            <th>Source Domain</th>
+            <th>Target Domain</th>
+            <th>Direction</th>
+            <th>Trust Type</th>
+            <th>Transitive</th>
+        </tr>        <tr>
+            <td>azgarlabs.com</td>
+            <td>azurebuddy.local</td>
+            <td>BiDirectional</td>
+            <td>Uplevel</td>
+            <td>True</td>
+        </tr>    </table>
+
+    <div class="section-title">DNS Zones</div>
+
+    <table>
+        <tr>
+            <th>Zone Name</th>
+            <th>Zone Type</th>
+            <th>Is AD Integrated</th>
+            <th>Replication Scope</th>
+            <th>
+                Dynamic Update
+                <button class="section-export-btn-inline" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">⇩</button>
+            </th>
+        </tr>        <tr>
+            <td>_msdcs.azgarlabs.com</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Forest</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>0.in-addr.arpa</td>
+            <td>Primary</td>
+            <td>False</td>
+            <td>None</td>
+            <td>None</td>
+        </tr>        <tr>
+            <td>127.in-addr.arpa</td>
+            <td>Primary</td>
+            <td>False</td>
+            <td>None</td>
+            <td>None</td>
+        </tr>        <tr>
+            <td>224.168.192.in-addr.arpa</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Domain</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>255.in-addr.arpa</td>
+            <td>Primary</td>
+            <td>False</td>
+            <td>None</td>
+            <td>None</td>
+        </tr>        <tr>
+            <td>azgarlabs.com</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Domain</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>azurebuddy.local</td>
+            <td>Forwarder</td>
+            <td>False</td>
+            <td>None</td>
+            <td></td>
+        </tr>        <tr>
+            <td>CACHE</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Forest</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>contoso.com</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Forest</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>oakcreekes.us</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Domain</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>startnetwork.in</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Domain</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>tailspintoy.com</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Forest</td>
+            <td>Secure</td>
+        </tr>        <tr>
+            <td>TrustAnchors</td>
+            <td>Primary</td>
+            <td>True</td>
+            <td>Forest</td>
+            <td>None</td>
+        </tr>    </table>
+
+    <div class="footer">
+        Enterprise Active Directory Operational Dashboard | Generated using PowerShell | by Azgar Mohammad
+    </div>
+
+</div>
+
+<script>
+function downloadCsv(fileName, csvContent) {
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+
+    link.setAttribute("href", url);
+    link.setAttribute("download", fileName);
+    link.style.visibility = "hidden";
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(url);
+}
+
+const domainControllersCsv = '"DomainController","IPv4Address","IsGC","OperatingSystem","Site"\n"vmdc01.azgarlabs.com","192.168.224.128","True","Windows Server 2019 Datacenter","Default-First-Site-Name"\n"vmdc02.azgarlabs.com","192.168.224.129","True","Windows Server 2019 Datacenter","Default-First-Site-Name"';
+const dcPingCsv = '"DomainController","IPv4Address","Site","ICMPStatus"\n"vmdc01.azgarlabs.com","192.168.224.128","Default-First-Site-Name","Reachable"\n"vmdc02.azgarlabs.com","192.168.224.129","Default-First-Site-Name","Not Responding"';
+const adSitesCsv = '"Name","Description"\n"DataCenter-USEast",\n"DataCenter-USWest",\n"Default-First-Site-Name",';
+const sitesWithNoDCsCsv = '"Name","Description"\n"DataCenter-USEast",\n"DataCenter-USWest",';
+const adSubnetsCsv = '"Name","Site","Location","Description"\n"172.16.0.0/24","DataCenter-USWest",,\n"192.168.10.0/24","DataCenter-USEast",,\n"192.168.224.0/24","Default-First-Site-Name",,';
+const dnsZonesCsv = '"ZoneName","ZoneType","IsDsIntegrated","ReplicationScope","DynamicUpdate"\n"_msdcs.azgarlabs.com","Primary","True","Forest","Secure"\n"0.in-addr.arpa","Primary","False","None","None"\n"127.in-addr.arpa","Primary","False","None","None"\n"224.168.192.in-addr.arpa","Primary","True","Domain","Secure"\n"255.in-addr.arpa","Primary","False","None","None"\n"azgarlabs.com","Primary","True","Domain","Secure"\n"azurebuddy.local","Forwarder","False","None",\n"CACHE","Primary","True","Forest","Secure"\n"contoso.com","Primary","True","Forest","Secure"\n"oakcreekes.us","Primary","True","Domain","Secure"\n"startnetwork.in","Primary","True","Domain","Secure"\n"tailspintoy.com","Primary","True","Forest","Secure"\n"TrustAnchors","Primary","True","Forest","None"';
+const gpoCsv = '"DisplayName","Id","Owner","GpoStatus","CreationTime","ModificationTime"\n"Windows OS Baseline","08481f11-7728-4670-b5d2-633b58a77a45","AZGARLABS\\Domain Admins","AllSettingsEnabled","12/23/2025 12:13:00 PM","3/23/2026 4:27:50 PM"\n"Default Domain Policy","31b2f340-016d-11d2-945f-00c04fb984f9","AZGARLABS\\Domain Admins","AllSettingsEnabled","10/30/2025 9:06:27 PM","11/24/2025 8:07:18 AM"\n"Baseline Security Policy","3cea4713-78e1-4989-a218-0bc692b42195","AZGARLABS\\Domain Admins","AllSettingsEnabled","5/18/2026 12:12:11 AM","5/18/2026 12:12:10 AM"\n"Default Domain Controllers Policy","6ac1786c-016f-11d2-945f-00c04fb984f9","AZGARLABS\\Domain Admins","AllSettingsEnabled","10/30/2025 9:06:27 PM","12/29/2025 11:13:12 AM"\n"TestDisableGPO","c9806083-d35c-4b7a-90df-1fd2b7317848","AZGARLABS\\Domain Admins","AllSettingsDisabled","5/18/2026 12:12:22 AM","5/18/2026 12:12:30 AM"';
+const unlinkedGpoCsv = '"DisplayName","Id","Owner","CreationTime","ModificationTime"\n"Baseline Security Policy","3cea4713-78e1-4989-a218-0bc692b42195","AZGARLABS\\Domain Admins","5/18/2026 12:12:11 AM","5/18/2026 12:12:10 AM"\n"TestDisableGPO","c9806083-d35c-4b7a-90df-1fd2b7317848","AZGARLABS\\Domain Admins","5/18/2026 12:12:22 AM","5/18/2026 12:12:30 AM"';
+const domainAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"Administrator",,"azgarlabs.com"\n"433351","John Doe","azgarlabs.com"\n"433786","Michael Jackson","azgarlabs.com"\n"admin-da","admin-da","azgarlabs.com"\n"Test.Account","Test Account","azgarlabs.com"\n"wsadmin","ws admin","azgarlabs.com"\n"serveradmin","srv Admin","azgarlabs.com"\n"admin-qa","qa admin","azgarlabs.com"\n"lab-admin","lab admin","azgarlabs.com"';
+const enterpriseAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"Administrator",,"azgarlabs.com"';
+const schemaAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"admin-da","admin-da","azgarlabs.com"\n"Administrator",,"azgarlabs.com"';
+</script>
+
+</body>
+</html>
