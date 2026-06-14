@@ -1,4 +1,659 @@
-﻿<!DOCTYPE html>
+#requires -modules ActiveDirectory
+
+<#
+.PARAMETER IncludeDCHealth
+    When set (default), collects per-DC hardware/performance/disk/service/replication
+    inventory for the "Domain Controller Health" tab via Get-DCInventory.ps1
+    (agentless, CIM/WinRM). Use -IncludeDCHealth:$false to skip this collection on very
+    large environments or when WinRM is not available, producing the Forest Overview
+    tab only.
+
+.PARAMETER DCHealthThrottleLimit
+    Maximum number of domain controllers queried in parallel for the DC Health tab.
+    Defaults to 10. Increase for large environments with many DCs.
+
+.PARAMETER DCHealthCredential
+    Optional credential used for the remote WinRM connections made by
+    Get-DCInventory.ps1.
+#>
+
+param(
+    [bool]$IncludeDCHealth = $true,
+    [int]$DCHealthThrottleLimit = 10,
+    [System.Management.Automation.PSCredential]$DCHealthCredential
+)
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+$ReportPath = "C:\Temp\Enterprise_AD_Operational_Dashboard.html"
+
+if (!(Test-Path "C:\Temp")) {
+    New-Item -Path "C:\Temp" -ItemType Directory | Out-Null
+}
+
+Write-Host "Collecting Enterprise Active Directory information..." -ForegroundColor Cyan
+
+function ConvertTo-HtmlSafe {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    return [System.Security.SecurityElement]::Escape($Value)
+}
+
+function ConvertTo-JavaScriptString {
+    param([string]$Value)
+
+    if ($null -eq $Value) { return "" }
+
+    return $Value `
+        -replace "\\", "\\" `
+        -replace "'", "\'" `
+        -replace "`r", "" `
+        -replace "`n", "\n"
+}
+
+function Convert-TimeSpanToReadable {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return "Not Configured"
+    }
+
+    if ($Value -is [TimeSpan]) {
+        return "$([math]::Abs($Value.Days)) Days"
+    }
+
+    return $Value.ToString()
+}
+
+function Get-CleanADSiteName {
+    param([string]$SiteValue)
+
+    if ([string]::IsNullOrWhiteSpace($SiteValue)) {
+        return "No site assigned"
+    }
+
+    if ($SiteValue -match "^CN=([^,]+),") {
+        return $matches[1]
+    }
+
+    return $SiteValue
+}
+
+function Get-ADGroupMemberDetailsSafe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Identity
+    )
+
+    try {
+        $Members = @(Get-ADGroupMember -Identity $Identity -Recursive -ErrorAction Stop |
+            Sort-Object Name |
+            Select-Object Name, SamAccountName, objectClass)
+
+        if ($Members.Count -eq 0) {
+            return [pscustomobject]@{
+                Count   = 0
+                Tooltip = "<div class='tooltip-line'>No members found</div>"
+            }
+        }
+
+        $Tooltip = ($Members | ForEach-Object {
+            $Name = ConvertTo-HtmlSafe $_.Name
+            $Sam  = ConvertTo-HtmlSafe $_.SamAccountName
+            $Type = ConvertTo-HtmlSafe $_.objectClass
+
+            if ($Sam) {
+                "<div class='tooltip-line'><b>$Name</b><span>$Sam ($Type)</span></div>"
+            }
+            else {
+                "<div class='tooltip-line'><b>$Name</b><span>$Type</span></div>"
+            }
+        }) -join ""
+
+        return [pscustomobject]@{
+            Count   = $Members.Count
+            Tooltip = $Tooltip
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Count   = "N/A"
+            Tooltip = "<div class='tooltip-line'>Unable to retrieve members</div>"
+        }
+    }
+}
+
+function Get-PrivilegedGroupCsv {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Identity,
+
+        [Parameter(Mandatory)]
+        [string]$DomainName
+    )
+
+    $ExportData = @(Get-ADGroupMember -Identity $Identity -Recursive -ErrorAction SilentlyContinue |
+        ForEach-Object {
+
+            $DisplayName = $null
+
+            if ($_.objectClass -eq "user") {
+                try {
+                    $User = Get-ADUser -Identity $_.SamAccountName -Properties DisplayName -ErrorAction Stop
+                    $DisplayName = $User.DisplayName
+                }
+                catch {
+                    $DisplayName = $_.Name
+                }
+            }
+            else {
+                $DisplayName = $_.Name
+            }
+
+            [pscustomobject]@{
+                SamAccountName = $_.SamAccountName
+                DisplayName    = $DisplayName
+                DomainName     = $DomainName
+            }
+        })
+
+    return $ExportData | ConvertTo-Csv -NoTypeInformation
+}
+
+$Domain  = Get-ADDomain
+$Forest  = Get-ADForest
+$RootDSE = Get-ADRootDSE
+
+$DomainName            = $Domain.DNSRoot
+$ForestRootDomain      = $Forest.RootDomain
+$NetBIOSName           = $Domain.NetBIOSName
+$ForestFunctionalLevel = $Forest.ForestMode
+$DomainFunctionalLevel = $Domain.DomainMode
+$GeneratedOn           = Get-Date -Format "dd-MMM-yyyy hh:mm:ss tt"
+
+$AllDomains  = @($Forest.Domains)
+$DomainCount = $AllDomains.Count
+
+$DomainTooltip = ""
+
+if ($DomainCount -gt 1) {
+    foreach ($DomainEntry in $AllDomains) {
+        if ($DomainEntry -eq $ForestRootDomain) {
+            $Type = "Root Domain"
+        }
+        else {
+            $Type = "Child Domain"
+        }
+
+        $DomainTooltip += "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $DomainEntry)</b><span>$Type</span></div>"
+    }
+
+    $DomainTooltip += "<div class='tooltip-line'><b>Forest Structure</b><span>Parent - Child Domain Forest</span></div>"
+}
+else {
+    $DomainTooltip += "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $ForestRootDomain)</b><span>Single Domain Forest</span></div>"
+}
+
+try {
+    $ConfigNC = $RootDSE.configurationNamingContext
+    $Partitions = Get-ADObject "CN=Partitions,$ConfigNC" -Properties uPNSuffixes
+    $UPNSuffixes = @($Partitions.uPNSuffixes)
+
+    if ($UPNSuffixes.Count -eq 0) {
+        $UPNSuffixes = @($DomainName)
+    }
+
+    $UPNSuffixesText = ($UPNSuffixes -join ", ")
+
+    $UPNSuffixTooltip = ($UPNSuffixes | ForEach-Object {
+        "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $_)</b><span>Configured UPN suffix</span></div>"
+    }) -join ""
+}
+catch {
+    $UPNSuffixesText = $DomainName
+    $UPNSuffixTooltip = "<div class='tooltip-line'><b>$DomainName</b><span>Default domain suffix</span></div>"
+}
+
+try {
+    $RecycleBinFeature = Get-ADOptionalFeature -Identity "Recycle Bin Feature" -ErrorAction Stop
+
+    if ($RecycleBinFeature.EnabledScopes.Count -gt 0) {
+        $ADRecycleBinStatus = "Enabled"
+        $RecycleBinHealth = "Good"
+    }
+    else {
+        $ADRecycleBinStatus = "Disabled"
+        $RecycleBinHealth = "Warning"
+    }
+}
+catch {
+    $ADRecycleBinStatus = "N/A"
+    $RecycleBinHealth = "Unknown"
+}
+
+try {
+    $DirectoryServicePath = "CN=Directory Service,CN=Windows NT,CN=Services,$ConfigNC"
+    $DirectoryService = Get-ADObject -Identity $DirectoryServicePath -Properties tombstoneLifetime -ErrorAction Stop
+
+    if ($DirectoryService.tombstoneLifetime) {
+        $TombstoneLifetime = "$($DirectoryService.tombstoneLifetime) Days"
+    }
+    else {
+        $TombstoneLifetime = "Default / Not Set"
+    }
+}
+catch {
+    $TombstoneLifetime = "N/A"
+}
+
+$DomainControllers = @(Get-ADDomainController -Filter *)
+$DomainControllerCount = $DomainControllers.Count
+
+# ---------------------------------------------------------------------------
+# Lightweight DC ICMP Ping Check
+# ---------------------------------------------------------------------------
+
+$DCPingResults = @(
+    foreach ($DC in $DomainControllers) {
+        $PingStatus = Test-Connection -ComputerName $DC.HostName -Count 1 -Quiet -ErrorAction SilentlyContinue
+
+        [pscustomobject]@{
+            DomainController = $DC.HostName
+            IPv4Address      = $DC.IPv4Address
+            Site             = $DC.Site
+            ICMPStatus       = if ($PingStatus) { "Reachable" } else { "Not Responding" }
+        }
+    }
+)
+
+$DCPingFailedCount = @($DCPingResults | Where-Object { $_.ICMPStatus -ne "Reachable" }).Count
+
+if ($DCPingFailedCount -gt 0) {
+    $DCPingHealth = "Warning"
+    $DCPingMessage = "$DCPingFailedCount DC(s) not responding to ICMP"
+}
+else {
+    $DCPingHealth = "Good"
+    $DCPingMessage = "All DCs responding to ICMP"
+}
+
+$DCPingTooltip = ($DCPingResults | ForEach-Object {
+    "<div class='tooltip-line'><b>$($_.DomainController)</b><span>$($_.ICMPStatus) | IP: $($_.IPv4Address) | Site: $($_.Site)</span></div>"
+}) -join ""
+
+$DCPingCsvJs = ConvertTo-JavaScriptString (
+    (
+        $DCPingResults |
+        ConvertTo-Csv -NoTypeInformation
+    ) -join "`n"
+)
+
+$DomainControllersCsv = $DomainControllers |
+    Select-Object `
+        @{Name="DomainController";Expression={$_.HostName}},
+        IPv4Address,
+        @{Name="IsGC";Expression={$_.IsGlobalCatalog}},
+        OperatingSystem,
+        Site |
+    ConvertTo-Csv -NoTypeInformation
+
+$DomainControllersCsvJs = ConvertTo-JavaScriptString ($DomainControllersCsv -join "`n")
+
+try {
+    $ADSites = @(Get-ADReplicationSite -Filter * -ErrorAction Stop)
+    $ADSiteCount = $ADSites.Count
+
+    $ADSubnets = @(Get-ADReplicationSubnet -Filter * -Properties Site, Location, Description -ErrorAction Stop)
+    $ADSubnetCount = $ADSubnets.Count
+
+    $SitesWithNoDCs = @(
+        foreach ($Site in $ADSites) {
+            $DCsInSite = @($DomainControllers | Where-Object { $_.Site -eq $Site.Name })
+
+            if ($DCsInSite.Count -eq 0) {
+                $Site
+            }
+        }
+    )
+
+    $SitesWithNoDCCount = $SitesWithNoDCs.Count
+
+    if ($SitesWithNoDCCount -gt 0) {
+        $SitesNoDCHealth = "Warning"
+    }
+        else {
+        $SitesNoDCHealth = "Good"
+    }
+
+
+    $ADSitesTooltip = ($ADSites | Sort-Object Name | ForEach-Object {
+        "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $_.Name)</b><span>Active Directory Site</span></div>"
+    }) -join ""
+
+    if (!$ADSitesTooltip) {
+        $ADSitesTooltip = "<div class='tooltip-line'>No AD sites found</div>"
+    }
+
+    $SitesWithNoDCTooltip = ($SitesWithNoDCs | Sort-Object Name | ForEach-Object {
+        "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $_.Name)</b><span>No domain controller found in this site</span></div>"
+    }) -join ""
+
+    if (!$SitesWithNoDCTooltip) {
+        $SitesWithNoDCTooltip = "<div class='tooltip-line'>All AD sites have at least one domain controller</div>"
+    }
+
+    $ADSubnetsTooltip = ($ADSubnets | Sort-Object Name | ForEach-Object {
+        $SubnetName = ConvertTo-HtmlSafe $_.Name
+        $SiteName = ConvertTo-HtmlSafe (Get-CleanADSiteName $_.Site)
+
+        "<div class='tooltip-line'><b>$SubnetName</b><span>Site: $SiteName</span></div>"
+    }) -join ""
+
+    if (!$ADSubnetsTooltip) {
+        $ADSubnetsTooltip = "<div class='tooltip-line'>No AD subnets found</div>"
+    }
+
+    $ADSitesCsvJs = ConvertTo-JavaScriptString (
+        (
+            $ADSites |
+            Sort-Object Name |
+            Select-Object Name, Description |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+
+    $SitesWithNoDCsCsvJs = ConvertTo-JavaScriptString (
+        (
+            $SitesWithNoDCs |
+            Sort-Object Name |
+            Select-Object Name, Description |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+
+    $ADSubnetsCsvJs = ConvertTo-JavaScriptString (
+        (
+            $ADSubnets |
+            Sort-Object Name |
+            Select-Object `
+                Name,
+                @{Name="Site";Expression={Get-CleanADSiteName $_.Site}},
+                Location,
+                Description |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+}
+catch {
+    $ADSites = $null
+    $ADSubnets = $null
+    $SitesWithNoDCs = @()
+
+    $ADSiteCount = "N/A"
+    $SitesWithNoDCCount = "N/A"
+    $ADSubnetCount = "N/A"
+
+    $ADSitesTooltip = "<div class='tooltip-line'>Unable to read AD sites</div>"
+    $SitesWithNoDCTooltip = "<div class='tooltip-line'>Unable to calculate sites with no DCs</div>"
+    $ADSubnetsTooltip = "<div class='tooltip-line'>Unable to read AD subnets</div>"
+
+    $ADSitesCsvJs = ""
+    $SitesWithNoDCsCsvJs = ""
+    $ADSubnetsCsvJs = ""
+}
+
+$FSMORoles = [ordered]@{
+    "Schema Master"         = $Forest.SchemaMaster
+    "Domain Naming Master"  = $Forest.DomainNamingMaster
+    "PDC Emulator"          = $Domain.PDCEmulator
+    "RID Master"            = $Domain.RIDMaster
+    "Infrastructure Master" = $Domain.InfrastructureMaster
+}
+
+$FSMORoleHolders = @($FSMORoles.Values | Select-Object -Unique)
+$FSMORoleHolderCount = $FSMORoleHolders.Count
+
+$FSMOTooltip = ($FSMORoles.GetEnumerator() | ForEach-Object {
+    "<div class='tooltip-line'><b>$(ConvertTo-HtmlSafe $_.Key)</b><span>$(ConvertTo-HtmlSafe $_.Value)</span></div>"
+}) -join ""
+
+try {
+    $PasswordPolicy = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+
+    $PasswordPolicySummary = "Min $($PasswordPolicy.MinPasswordLength) | Max $([math]::Abs($PasswordPolicy.MaxPasswordAge.Days)) Days"
+
+    $PasswordPolicyTooltip = @"
+<div class='tooltip-line'><b>Minimum Password Length</b><span>$($PasswordPolicy.MinPasswordLength)</span></div>
+<div class='tooltip-line'><b>Maximum Password Age</b><span>$(Convert-TimeSpanToReadable $PasswordPolicy.MaxPasswordAge)</span></div>
+<div class='tooltip-line'><b>Minimum Password Age</b><span>$(Convert-TimeSpanToReadable $PasswordPolicy.MinPasswordAge)</span></div>
+<div class='tooltip-line'><b>Password History Count</b><span>$($PasswordPolicy.PasswordHistoryCount)</span></div>
+<div class='tooltip-line'><b>Complexity Enabled</b><span>$($PasswordPolicy.ComplexityEnabled)</span></div>
+<div class='tooltip-line'><b>Reversible Encryption Enabled</b><span>$($PasswordPolicy.ReversibleEncryptionEnabled)</span></div>
+<div class='tooltip-line'><b>Lockout Threshold</b><span>$($PasswordPolicy.LockoutThreshold)</span></div>
+<div class='tooltip-line'><b>Lockout Duration</b><span>$(Convert-TimeSpanToReadable $PasswordPolicy.LockoutDuration)</span></div>
+<div class='tooltip-line'><b>Lockout Observation Window</b><span>$(Convert-TimeSpanToReadable $PasswordPolicy.LockoutObservationWindow)</span></div>
+"@
+}
+catch {
+    $PasswordPolicySummary = "N/A"
+    $PasswordPolicyTooltip = "<div class='tooltip-line'>Unable to read password policy</div>"
+}
+
+$DomainAdmins     = Get-ADGroupMemberDetailsSafe -Identity "Domain Admins"
+$EnterpriseAdmins = Get-ADGroupMemberDetailsSafe -Identity "Enterprise Admins"
+$SchemaAdmins     = Get-ADGroupMemberDetailsSafe -Identity "Schema Admins"
+
+$DomainAdminsCsvJs = ConvertTo-JavaScriptString ((Get-PrivilegedGroupCsv -Identity "Domain Admins" -DomainName $DomainName) -join "`n")
+$EnterpriseAdminsCsvJs = ConvertTo-JavaScriptString ((Get-PrivilegedGroupCsv -Identity "Enterprise Admins" -DomainName $DomainName) -join "`n")
+$SchemaAdminsCsvJs = ConvertTo-JavaScriptString ((Get-PrivilegedGroupCsv -Identity "Schema Admins" -DomainName $DomainName) -join "`n")
+
+try {
+    Import-Module DnsServer -ErrorAction Stop
+
+    $DnsZones = @(Get-DnsServerZone -ErrorAction Stop)
+
+    $DnsZoneCount = $DnsZones.Count
+    $ADIntegratedDnsZoneCount = @($DnsZones | Where-Object { $_.IsDsIntegrated -eq $true }).Count
+    $StandaloneDnsZoneCount = @($DnsZones | Where-Object { $_.IsDsIntegrated -ne $true }).Count
+
+    $DnsZonesCsvJs = ConvertTo-JavaScriptString (
+        (
+            $DnsZones |
+            Select-Object ZoneName, ZoneType, IsDsIntegrated, ReplicationScope, DynamicUpdate |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+}
+catch {
+    $DnsZones = $null
+    $DnsZoneCount = "N/A"
+    $ADIntegratedDnsZoneCount = "N/A"
+    $StandaloneDnsZoneCount = "N/A"
+    $DnsZonesCsvJs = ""
+}
+
+try {
+    Import-Module GroupPolicy -ErrorAction Stop
+
+    $AllGPOs = @(Get-GPO -All)
+    $GPOCount = $AllGPOs.Count
+
+    $DisabledGPOs = @($AllGPOs | Where-Object {
+        $_.GpoStatus -ne "AllSettingsEnabled"
+    })
+
+    $DisabledGPOCount = $DisabledGPOs.Count
+
+    $UnlinkedGPOs = @(
+        foreach ($GPO in $AllGPOs) {
+            try {
+                [xml]$Report = Get-GPOReport -Guid $GPO.Id -ReportType Xml
+
+                if ($Report.GPO.LinksTo.Count -eq 0) {
+                    $GPO
+                }
+            }
+            catch {}
+        }
+    )
+
+    $UnlinkedGPOCount = $UnlinkedGPOs.Count
+
+    $GpoCsvJs = ConvertTo-JavaScriptString (
+        (
+            $AllGPOs |
+            Select-Object DisplayName, Id, Owner, GpoStatus, CreationTime, ModificationTime |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+
+    $UnlinkedGpoCsvJs = ConvertTo-JavaScriptString (
+        (
+            $UnlinkedGPOs |
+            Select-Object DisplayName, Id, Owner, CreationTime, ModificationTime |
+            ConvertTo-Csv -NoTypeInformation
+        ) -join "`n"
+    )
+}
+catch {
+    $GPOCount = "N/A"
+    $DisabledGPOCount = "N/A"
+    $UnlinkedGPOCount = "N/A"
+    $GpoCsvJs = ""
+    $UnlinkedGpoCsvJs = ""
+}
+
+$TotalUsers = @(Get-ADUser -LDAPFilter "(objectCategory=person)" -ResultSetSize $null).Count
+
+$ActiveUsers = @(Get-ADUser `
+    -LDAPFilter "(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
+    -ResultSetSize $null).Count
+
+$DisabledUsers = @(Get-ADUser `
+    -LDAPFilter "(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2))" `
+    -ResultSetSize $null).Count
+
+$TotalGroups = @(Get-ADGroup -LDAPFilter "(objectClass=group)" -ResultSetSize $null).Count
+
+$SecurityGroups = @(Get-ADGroup `
+    -LDAPFilter "(&(objectClass=group)(groupType:1.2.840.113556.1.4.803:=2147483648))" `
+    -ResultSetSize $null).Count
+
+$DistributionGroups = @(Get-ADGroup `
+    -LDAPFilter "(&(objectClass=group)(!(groupType:1.2.840.113556.1.4.803:=2147483648)))" `
+    -ResultSetSize $null).Count
+
+$TotalComputers = @(Get-ADComputer -LDAPFilter "(objectCategory=computer)" -ResultSetSize $null).Count
+
+$ActiveComputers = @(Get-ADComputer `
+    -LDAPFilter "(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" `
+    -ResultSetSize $null).Count
+
+$DisabledComputers = @(Get-ADComputer `
+    -LDAPFilter "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=2))" `
+    -ResultSetSize $null).Count
+
+try {
+    $Trusts = @(Get-ADTrust -Filter * -ErrorAction Stop)
+}
+catch {
+    $Trusts = $null
+}
+
+# ---------------------------------------------------------------------------
+# Domain Controller Health tab - data collection
+#
+# DC list/sidebar data (name, site, GC flag, OS, FSMO roles) is always built
+# from $DomainControllers above. Per-DC hardware/performance/disk/service/
+# replication detail is collected agentlessly via Get-DCInventory.ps1
+# (CIM/WinRM) when -IncludeDCHealth is set (default). The DC list is built
+# dynamically for however many DCs exist - nothing is capped or hardcoded -
+# the sidebar list simply scrolls once it exceeds the visible area.
+# ---------------------------------------------------------------------------
+
+$FSMOByServer = @{}
+
+foreach ($RoleEntry in $FSMORoles.GetEnumerator()) {
+    $RoleServer = $RoleEntry.Value
+
+    if (![string]::IsNullOrWhiteSpace($RoleServer)) {
+        if (-not $FSMOByServer.ContainsKey($RoleServer)) {
+            $FSMOByServer[$RoleServer] = @()
+        }
+
+        $FSMOByServer[$RoleServer] += $RoleEntry.Key
+    }
+}
+
+$DCListData = @(
+    $DomainControllers | ForEach-Object {
+        $ShortRoles = @($FSMOByServer[$_.HostName] | ForEach-Object {
+            switch ($_) {
+                "Schema Master"         { "Schema Master" }
+                "Domain Naming Master"  { "Domain Naming Master" }
+                "PDC Emulator"          { "PDC Emulator" }
+                "RID Master"            { "RID Master" }
+                "Infrastructure Master" { "Infrastructure Master" }
+                default                 { $_ }
+            }
+        })
+
+        [ordered]@{
+            Name            = $_.HostName
+            IPv4Address     = $_.IPv4Address
+            Site            = Get-CleanADSiteName $_.Site
+            IsGlobalCatalog = [bool]$_.IsGlobalCatalog
+            OperatingSystem = $_.OperatingSystem
+            FSMORoles       = $ShortRoles
+        }
+    }
+)
+
+$DCInventory = @()
+
+if ($IncludeDCHealth) {
+    $CollectorScriptPath = Join-Path -Path $PSScriptRoot -ChildPath "Get-DCInventory.ps1"
+
+    if (Test-Path $CollectorScriptPath) {
+        try {
+            . $CollectorScriptPath
+
+            $InventoryParams = @{
+                ComputerName  = @($DomainControllers.HostName)
+                ThrottleLimit = $DCHealthThrottleLimit
+            }
+
+            if ($DCHealthCredential) {
+                $InventoryParams.Credential = $DCHealthCredential
+            }
+
+            $DCInventory = @(Get-AllDCInventory @InventoryParams)
+        }
+        catch {
+            Write-Host "Warning: DC Health collection failed - $($_.Exception.Message)" -ForegroundColor Yellow
+            $DCInventory = @()
+        }
+    }
+    else {
+        Write-Host "Warning: Get-DCInventory.ps1 not found alongside this script - Domain Controller Health tab will show DC list only." -ForegroundColor Yellow
+    }
+}
+
+$DCListJson = ($DCListData | ConvertTo-Json -Depth 6 -Compress) -replace "</script>", "<\/script>"
+
+if ($DCInventory.Count -gt 0) {
+    $DCInventoryJson = ($DCInventory | ConvertTo-Json -Depth 8 -Compress) -replace "</script>", "<\/script>"
+}
+else {
+    $DCInventoryJson = "[]"
+}
+
+$html = @"
+<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -898,13 +1553,13 @@
 
 <body>
 
-<div class="page-generated">Generated On: 13-Jun-2026 09:51:19 PM</div>
+<div class="page-generated">Generated On: $GeneratedOn</div>
 
 <div class="container">
 
     <div class="header">
         <div class="header-title">Enterprise Active Directory Health Dashboard</div>
-        <div class="header-subtitle">Forest: azgarlabs.com &nbsp;|&nbsp; Domain: azgarlabs.com &nbsp;|&nbsp; 4 Domain Controllers &nbsp;|&nbsp; Generated: 13-Jun-2026 09:51:19 PM</div>
+        <div class="header-subtitle">Forest: $ForestRootDomain &nbsp;|&nbsp; Domain: $DomainName &nbsp;|&nbsp; $DomainControllerCount Domain Controllers &nbsp;|&nbsp; Generated: $GeneratedOn</div>
     </div>
 
     <div class="tab-bar">
@@ -923,52 +1578,52 @@
 
             <div class="config-tile">
                 <div class="config-label">Forest Root Domain</div>
-                <div class="config-value">azgarlabs.com</div>
+                <div class="config-value">$ForestRootDomain</div>
                 <div class="config-footer">Forest root domain</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">Domains</div>
-                <div class="config-value">1</div>
+                <div class="config-value">$DomainCount</div>
                 <div class="config-footer">Hover for details</div>
-                <div class="tooltip-box"><div class='tooltip-line'><b>azgarlabs.com</b><span>Single Domain Forest</span></div></div>
+                <div class="tooltip-box">$DomainTooltip</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">NetBIOS Name</div>
-                <div class="config-value">AZGARLABS</div>
+                <div class="config-value">$NetBIOSName</div>
                 <div class="config-footer">AD NetBIOS namespace</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">UPN Domain Suffixes</div>
-                <div class="config-value-small">azurebuddy.in</div>
+                <div class="config-value-small">$UPNSuffixesText</div>
                 <div class="config-footer">Additional UPN suffixes configured in forest</div>
-                <div class="tooltip-box"><div class='tooltip-line'><b>azurebuddy.in</b><span>Configured UPN suffix</span></div></div>
+                <div class="tooltip-box">$UPNSuffixTooltip</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">Forest Functional Level</div>
-                <div class="config-value">Windows2016Forest</div>
+                <div class="config-value">$ForestFunctionalLevel</div>
                 <div class="config-footer">Forest-wide functional mode</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">Domain Functional Level</div>
-                <div class="config-value">Windows2016Domain</div>
+                <div class="config-value">$DomainFunctionalLevel</div>
                 <div class="config-footer">Current domain functional mode</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">AD Recycle Bin Status</div>
-                <div class="config-value">Disabled</div>
-                <span class="health health-warning">Warning</span>
+                <div class="config-value">$ADRecycleBinStatus</div>
+                <span class="health health-$($RecycleBinHealth.ToLower())">$RecycleBinHealth</span>
                 <div class="config-footer">Deleted object recovery capability</div>
             </div>
 
             <div class="config-tile">
                 <div class="config-label">Tombstone Lifetime</div>
-                <div class="config-value">180 Days</div>
+                <div class="config-value">$TombstoneLifetime</div>
                 <div class="config-footer">Deleted object lifetime</div>
             </div>
 
@@ -983,16 +1638,16 @@
             <div class="tile-top">
                 <div class="tile-title">Domain Controllers</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export DC ICMP Status" onclick="downloadCsv('DC_ICMP_Status.csv', dcPingCsv)">⇩</button>
+                    <button class="export-btn" title="Export DC ICMP Status" onclick="downloadCsv('DC_ICMP_Status.csv', dcPingCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">DC</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">4</div>
-                <span class="health health-good">Good</span>
-                <div class="tile-footer">All DCs responding to ICMP</div>
+                <div class="tile-value">$DomainControllerCount</div>
+                <span class="health health-$($DCPingHealth.ToLower())">$DCPingHealth</span>
+                <div class="tile-footer">$DCPingMessage</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>vmdc01.azgarlabs.com</b><span>Reachable | IP: 192.168.224.128 | Site: Default-First-Site-Name</span></div><div class='tooltip-line'><b>vmdc02.azgarlabs.com</b><span>Reachable | IP: 192.168.224.129 | Site: DataCenter-USEast</span></div><div class='tooltip-line'><b>vmdc03.azgarlabs.com</b><span>Reachable | IP: 192.168.224.130 | Site: DataCenter-USEast</span></div><div class='tooltip-line'><b>WIN2022-DC04.azgarlabs.com</b><span>Reachable | IP: 192.168.224.132 | Site: Default-First-Site-Name</span></div></div>
+            <div class="tooltip-box">$DCPingTooltip</div>
         </div>
 
         <div class="tile accent-cyan">
@@ -1001,10 +1656,10 @@
                 <div class="tile-icon">FS</div>
             </div>
             <div>
-                <div class="tile-value">1</div>
+                <div class="tile-value">$FSMORoleHolderCount</div>
                 <div class="tile-footer">Hover to view role holder names</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>Schema Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>Domain Naming Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>PDC Emulator</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>RID Master</b><span>vmdc01.azgarlabs.com</span></div><div class='tooltip-line'><b>Infrastructure Master</b><span>vmdc01.azgarlabs.com</span></div></div>
+            <div class="tooltip-box">$FSMOTooltip</div>
         </div>
 
         <div class="tile accent-green">
@@ -1013,121 +1668,113 @@
                 <div class="tile-icon">PW</div>
             </div>
             <div>
-                <div class="tile-value-small">Min 7 | Max 42 Days</div>
+                <div class="tile-value-small">$PasswordPolicySummary</div>
                 <div class="tile-footer">Hover to view full policy</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>Minimum Password Length</b><span>7</span></div>
-<div class='tooltip-line'><b>Maximum Password Age</b><span>42 Days</span></div>
-<div class='tooltip-line'><b>Minimum Password Age</b><span>1 Days</span></div>
-<div class='tooltip-line'><b>Password History Count</b><span>24</span></div>
-<div class='tooltip-line'><b>Complexity Enabled</b><span>True</span></div>
-<div class='tooltip-line'><b>Reversible Encryption Enabled</b><span>False</span></div>
-<div class='tooltip-line'><b>Lockout Threshold</b><span>4</span></div>
-<div class='tooltip-line'><b>Lockout Duration</b><span>0 Days</span></div>
-<div class='tooltip-line'><b>Lockout Observation Window</b><span>0 Days</span></div></div>
+            <div class="tooltip-box">$PasswordPolicyTooltip</div>
         </div>
 
         <div class="tile accent-green">
             <div class="tile-top">
                 <div class="tile-title">AD Sites</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export AD Sites" onclick="downloadCsv('AD_Sites.csv', adSitesCsv)">⇩</button>
+                    <button class="export-btn" title="Export AD Sites" onclick="downloadCsv('AD_Sites.csv', adSitesCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">ST</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">2</div>
+                <div class="tile-value">$ADSiteCount</div>
                 <div class="tile-footer">Hover to view site names</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>DataCenter-USEast</b><span>Active Directory Site</span></div><div class='tooltip-line'><b>Default-First-Site-Name</b><span>Active Directory Site</span></div></div>
+            <div class="tooltip-box">$ADSitesTooltip</div>
         </div>
 
         <div class="tile accent-orange">
             <div class="tile-top">
                 <div class="tile-title">Sites with No DCs</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export Sites with No DCs" onclick="downloadCsv('Sites_With_No_DCs.csv', sitesWithNoDCsCsv)">⇩</button>
+                    <button class="export-btn" title="Export Sites with No DCs" onclick="downloadCsv('Sites_With_No_DCs.csv', sitesWithNoDCsCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">ND</div>
             </div>
         </div>
      <div>
-        <div class="tile-value">0</div>
-        <span class="health health-good">Good</span>
+        <div class="tile-value">$SitesWithNoDCCount</div>
+        <span class="health health-$($SitesNoDCHealth.ToLower())">$SitesNoDCHealth</span>
         <div class="tile-footer">Sites without local domain controllers</div>
         </div>
-        <div class="tooltip-box"><div class='tooltip-line'>All AD sites have at least one domain controller</div></div>
+        <div class="tooltip-box">$SitesWithNoDCTooltip</div>
     </div>
 
         <div class="tile accent-blue">
             <div class="tile-top">
                 <div class="tile-title">Subnets</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export AD Subnets" onclick="downloadCsv('AD_Subnets.csv', adSubnetsCsv)">⇩</button>
+                    <button class="export-btn" title="Export AD Subnets" onclick="downloadCsv('AD_Subnets.csv', adSubnetsCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">SN</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">3</div>
+                <div class="tile-value">$ADSubnetCount</div>
                 <div class="tile-footer">Hover to view subnet to site mapping</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>172.16.0.0/24</b><span>Site: No site assigned</span></div><div class='tooltip-line'><b>192.168.10.0/24</b><span>Site: DataCenter-USEast</span></div><div class='tooltip-line'><b>192.168.224.0/24</b><span>Site: Default-First-Site-Name</span></div></div>
+            <div class="tooltip-box">$ADSubnetsTooltip</div>
         </div>
 
         <div class="tile accent-red">
             <div class="tile-top">
                 <div class="tile-title">Domain Admins</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export Domain Admins" onclick="downloadCsv('Domain_Admins.csv', domainAdminsCsv)">⇩</button>
+                    <button class="export-btn" title="Export Domain Admins" onclick="downloadCsv('Domain_Admins.csv', domainAdminsCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">DA</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">9</div>
+                <div class="tile-value">$($DomainAdmins.Count)</div>
                 <div class="tile-footer">Privileged group members</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>admin-da</b><span>admin-da (user)</span></div><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div><div class='tooltip-line'><b>John Doe</b><span>433351 (user)</span></div><div class='tooltip-line'><b>lab admin</b><span>lab-admin (user)</span></div><div class='tooltip-line'><b>Michael Jackson</b><span>433786 (user)</span></div><div class='tooltip-line'><b>qa admin</b><span>admin-qa (user)</span></div><div class='tooltip-line'><b>srv Admin</b><span>serveradmin (user)</span></div><div class='tooltip-line'><b>Test Account</b><span>Test.Account (user)</span></div><div class='tooltip-line'><b>ws admin</b><span>wsadmin (user)</span></div></div>
+            <div class="tooltip-box">$($DomainAdmins.Tooltip)</div>
         </div>
 
         <div class="tile accent-purple">
             <div class="tile-top">
                 <div class="tile-title">Enterprise Admins</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export Enterprise Admins" onclick="downloadCsv('Enterprise_Admins.csv', enterpriseAdminsCsv)">⇩</button>
+                    <button class="export-btn" title="Export Enterprise Admins" onclick="downloadCsv('Enterprise_Admins.csv', enterpriseAdminsCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">EA</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">1</div>
+                <div class="tile-value">$($EnterpriseAdmins.Count)</div>
                 <div class="tile-footer">Forest-level privileged members</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div></div>
+            <div class="tooltip-box">$($EnterpriseAdmins.Tooltip)</div>
         </div>
 
         <div class="tile accent-orange">
             <div class="tile-top">
                 <div class="tile-title">Schema Admins</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export Schema Admins" onclick="downloadCsv('Schema_Admins.csv', schemaAdminsCsv)">⇩</button>
+                    <button class="export-btn" title="Export Schema Admins" onclick="downloadCsv('Schema_Admins.csv', schemaAdminsCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">SA</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">2</div>
+                <div class="tile-value">$($SchemaAdmins.Count)</div>
                 <div class="tile-footer">Schema modification members</div>
             </div>
-            <div class="tooltip-box"><div class='tooltip-line'><b>admin-da</b><span>admin-da (user)</span></div><div class='tooltip-line'><b>Administrator</b><span>Administrator (user)</span></div></div>
+            <div class="tooltip-box">$($SchemaAdmins.Tooltip)</div>
         </div>
 
         <div class="tile accent-orange">
             <div class="tile-top">
                 <div class="tile-title">DNS Zones</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">⇩</button>
+                    <button class="export-btn" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">DNS</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">13</div>
+                <div class="tile-value">$DnsZoneCount</div>
                 <div class="tile-footer">Total DNS zones</div>
             </div>
         </div>
@@ -1138,7 +1785,7 @@
                 <div class="tile-icon">ADI</div>
             </div>
             <div>
-                <div class="tile-value">9</div>
+                <div class="tile-value">$ADIntegratedDnsZoneCount</div>
                 <div class="tile-footer">Directory-integrated zones</div>
             </div>
         </div>
@@ -1149,7 +1796,7 @@
                 <div class="tile-icon">STD</div>
             </div>
             <div>
-                <div class="tile-value">4</div>
+                <div class="tile-value">$StandaloneDnsZoneCount</div>
                 <div class="tile-footer">File-backed / non-AD zones</div>
             </div>
         </div>
@@ -1158,12 +1805,12 @@
             <div class="tile-top">
                 <div class="tile-title">GPO Count</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export GPO Inventory" onclick="downloadCsv('GPO_Inventory.csv', gpoCsv)">⇩</button>
+                    <button class="export-btn" title="Export GPO Inventory" onclick="downloadCsv('GPO_Inventory.csv', gpoCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">GP</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">5</div>
+                <div class="tile-value">$GPOCount</div>
                 <div class="tile-footer">Group Policy Objects</div>
             </div>
         </div>
@@ -1172,12 +1819,12 @@
             <div class="tile-top">
                 <div class="tile-title">Unlinked GPOs</div>
                 <div class="tile-actions">
-                    <button class="export-btn" title="Export Unlinked GPOs" onclick="downloadCsv('Unlinked_GPOs.csv', unlinkedGpoCsv)">⇩</button>
+                    <button class="export-btn" title="Export Unlinked GPOs" onclick="downloadCsv('Unlinked_GPOs.csv', unlinkedGpoCsv)">$([char]0x21E9)</button>
                     <div class="tile-icon">UL</div>
                 </div>
             </div>
             <div>
-                <div class="tile-value">2</div>
+                <div class="tile-value">$UnlinkedGPOCount</div>
                 <div class="tile-footer">No Site / Domain / OU links</div>
             </div>
         </div>
@@ -1188,7 +1835,7 @@
                 <div class="tile-icon">DG</div>
             </div>
             <div>
-                <div class="tile-value">1</div>
+                <div class="tile-value">$DisabledGPOCount</div>
                 <div class="tile-footer">User / Computer settings disabled</div>
             </div>
         </div>
@@ -1199,7 +1846,7 @@
                 <div class="tile-icon">U</div>
             </div>
             <div>
-                <div class="tile-value">31</div>
+                <div class="tile-value">$TotalUsers</div>
                 <div class="tile-footer">All user objects</div>
             </div>
         </div>
@@ -1210,7 +1857,7 @@
                 <div class="tile-icon">AU</div>
             </div>
             <div>
-                <div class="tile-value">27</div>
+                <div class="tile-value">$ActiveUsers</div>
                 <div class="tile-footer">Enabled users</div>
             </div>
         </div>
@@ -1221,7 +1868,7 @@
                 <div class="tile-icon">DU</div>
             </div>
             <div>
-                <div class="tile-value">4</div>
+                <div class="tile-value">$DisabledUsers</div>
                 <div class="tile-footer">Disabled users</div>
             </div>
         </div>
@@ -1232,7 +1879,7 @@
                 <div class="tile-icon">G</div>
             </div>
             <div>
-                <div class="tile-value">67</div>
+                <div class="tile-value">$TotalGroups</div>
                 <div class="tile-footer">All group objects</div>
             </div>
         </div>
@@ -1243,7 +1890,7 @@
                 <div class="tile-icon">SG</div>
             </div>
             <div>
-                <div class="tile-value">60</div>
+                <div class="tile-value">$SecurityGroups</div>
                 <div class="tile-footer">Security-enabled groups</div>
             </div>
         </div>
@@ -1254,7 +1901,7 @@
                 <div class="tile-icon">DG</div>
             </div>
             <div>
-                <div class="tile-value">7</div>
+                <div class="tile-value">$DistributionGroups</div>
                 <div class="tile-footer">Mail distribution groups</div>
             </div>
         </div>
@@ -1265,7 +1912,7 @@
                 <div class="tile-icon">C</div>
             </div>
             <div>
-                <div class="tile-value">10</div>
+                <div class="tile-value">$TotalComputers</div>
                 <div class="tile-footer">All computer objects</div>
             </div>
         </div>
@@ -1276,7 +1923,7 @@
                 <div class="tile-icon">AC</div>
             </div>
             <div>
-                <div class="tile-value">9</div>
+                <div class="tile-value">$ActiveComputers</div>
                 <div class="tile-footer">Enabled computers</div>
             </div>
         </div>
@@ -1287,7 +1934,7 @@
                 <div class="tile-icon">DC</div>
             </div>
             <div>
-                <div class="tile-value">1</div>
+                <div class="tile-value">$DisabledComputers</div>
                 <div class="tile-footer">Disabled computers</div>
             </div>
         </div>
@@ -1303,23 +1950,23 @@
         </tr>
         <tr>
             <td>Schema Master</td>
-            <td>vmdc01.azgarlabs.com</td>
+            <td>$($Forest.SchemaMaster)</td>
         </tr>
         <tr>
             <td>Domain Naming Master</td>
-            <td>vmdc01.azgarlabs.com</td>
+            <td>$($Forest.DomainNamingMaster)</td>
         </tr>
         <tr>
             <td>PDC Emulator</td>
-            <td>vmdc01.azgarlabs.com</td>
+            <td>$($Domain.PDCEmulator)</td>
         </tr>
         <tr>
             <td>RID Master</td>
-            <td>vmdc01.azgarlabs.com</td>
+            <td>$($Domain.RIDMaster)</td>
         </tr>
         <tr>
             <td>Infrastructure Master</td>
-            <td>vmdc01.azgarlabs.com</td>
+            <td>$($Domain.InfrastructureMaster)</td>
         </tr>
     </table>
 
@@ -1333,33 +1980,25 @@
             <th>Operating System</th>
             <th>
                 Site
-                <button class="section-export-btn-inline" title="Export Domain Controllers" onclick="downloadCsv('Domain_Controllers.csv', domainControllersCsv)">⇩</button>
+                <button class="section-export-btn-inline" title="Export Domain Controllers" onclick="downloadCsv('Domain_Controllers.csv', domainControllersCsv)">$([char]0x21E9)</button>
             </th>
-        </tr>        <tr>
-            <td>vmdc01.azgarlabs.com</td>
-            <td>192.168.224.128</td>
-            <td>True</td>
-            <td>Windows Server 2019 Datacenter</td>
-            <td>Default-First-Site-Name</td>
-        </tr>        <tr>
-            <td>vmdc02.azgarlabs.com</td>
-            <td>192.168.224.129</td>
-            <td>True</td>
-            <td>Windows Server 2019 Datacenter</td>
-            <td>DataCenter-USEast</td>
-        </tr>        <tr>
-            <td>vmdc03.azgarlabs.com</td>
-            <td>192.168.224.130</td>
-            <td>True</td>
-            <td>Windows Server 2019 Standard Evaluation</td>
-            <td>DataCenter-USEast</td>
-        </tr>        <tr>
-            <td>WIN2022-DC04.azgarlabs.com</td>
-            <td>192.168.224.132</td>
-            <td>True</td>
-            <td>Windows Server 2022 Standard Evaluation</td>
-            <td>Default-First-Site-Name</td>
-        </tr>    </table>
+        </tr>
+"@
+
+foreach ($DC in $DomainControllers) {
+    $html += @"
+        <tr>
+            <td>$($DC.HostName)</td>
+            <td>$($DC.IPv4Address)</td>
+            <td>$($DC.IsGlobalCatalog)</td>
+            <td>$($DC.OperatingSystem)</td>
+            <td>$($DC.Site)</td>
+        </tr>
+"@
+}
+
+$html += @"
+    </table>
 
     <div class="section-title">Trust Relationships</div>
 
@@ -1370,13 +2009,34 @@
             <th>Direction</th>
             <th>Trust Type</th>
             <th>Transitive</th>
-        </tr>        <tr>
-            <td>azgarlabs.com</td>
-            <td>azurebuddy.local</td>
-            <td>BiDirectional</td>
-            <td>Uplevel</td>
-            <td>True</td>
-        </tr>    </table>
+        </tr>
+"@
+
+if ($Trusts) {
+    foreach ($Trust in $Trusts) {
+        $IsTransitive = $Trust.DisallowTransivity -eq $false
+
+        $html += @"
+        <tr>
+            <td>$DomainName</td>
+            <td>$($Trust.Name)</td>
+            <td>$($Trust.Direction)</td>
+            <td>$($Trust.TrustType)</td>
+            <td>$IsTransitive</td>
+        </tr>
+"@
+    }
+}
+else {
+    $html += @"
+        <tr>
+            <td colspan="5">No trust relationships found or unable to read trust information.</td>
+        </tr>
+"@
+}
+
+$html += @"
+    </table>
 
     <div class="section-title">DNS Zones</div>
 
@@ -1388,87 +2048,34 @@
             <th>Replication Scope</th>
             <th>
                 Dynamic Update
-                <button class="section-export-btn-inline" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">⇩</button>
+                <button class="section-export-btn-inline" title="Export DNS Zones" onclick="downloadCsv('DNS_Zones.csv', dnsZonesCsv)">$([char]0x21E9)</button>
             </th>
-        </tr>        <tr>
-            <td>_msdcs.azgarlabs.com</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Forest</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>0.in-addr.arpa</td>
-            <td>Primary</td>
-            <td>False</td>
-            <td>None</td>
-            <td>None</td>
-        </tr>        <tr>
-            <td>127.in-addr.arpa</td>
-            <td>Primary</td>
-            <td>False</td>
-            <td>None</td>
-            <td>None</td>
-        </tr>        <tr>
-            <td>224.168.192.in-addr.arpa</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Domain</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>255.in-addr.arpa</td>
-            <td>Primary</td>
-            <td>False</td>
-            <td>None</td>
-            <td>None</td>
-        </tr>        <tr>
-            <td>azgarlabs.com</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Domain</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>azurebuddy.local</td>
-            <td>Forwarder</td>
-            <td>False</td>
-            <td>None</td>
-            <td></td>
-        </tr>        <tr>
-            <td>CACHE</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Forest</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>contoso.com</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Forest</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>oakcreekes.us</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Domain</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>startnetwork.in</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Domain</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>tailspintoy.com</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Forest</td>
-            <td>Secure</td>
-        </tr>        <tr>
-            <td>TrustAnchors</td>
-            <td>Primary</td>
-            <td>True</td>
-            <td>Forest</td>
-            <td>None</td>
-        </tr>    </table>
+        </tr>
+"@
+
+if ($DnsZones) {
+    foreach ($Zone in $DnsZones) {
+        $html += @"
+        <tr>
+            <td>$($Zone.ZoneName)</td>
+            <td>$($Zone.ZoneType)</td>
+            <td>$($Zone.IsDsIntegrated)</td>
+            <td>$($Zone.ReplicationScope)</td>
+            <td>$($Zone.DynamicUpdate)</td>
+        </tr>
+"@
+    }
+}
+else {
+    $html += @"
+        <tr>
+            <td colspan="5">DNS Server module unavailable or unable to read DNS zones.</td>
+        </tr>
+"@
+}
+
+$html += @"
+    </table>
 
     </div>
 
@@ -1537,13 +2144,13 @@
 
     <div class="footer">
         <div class="footer-line">Enterprise Active Directory Health Dashboard | Generated using PowerShell</div>
-        <div class="footer-line footer-copyright">&copy; 2026 Azgar Mohammad. All rights reserved. | For internal IT operations use only.</div>
+        <div class="footer-line footer-copyright">&copy; $(Get-Date -Format yyyy) Azgar Mohammad. All rights reserved. | For internal IT operations use only.</div>
     </div>
 
 </div>
 
-<script id="dc-list-data" type="application/json">[{"Name":"vmdc01.azgarlabs.com","IPv4Address":"192.168.224.128","Site":"Default-First-Site-Name","IsGlobalCatalog":true,"OperatingSystem":"Windows Server 2019 Datacenter","FSMORoles":["Schema Master","Domain Naming Master","PDC Emulator","RID Master","Infrastructure Master"]},{"Name":"vmdc02.azgarlabs.com","IPv4Address":"192.168.224.129","Site":"DataCenter-USEast","IsGlobalCatalog":true,"OperatingSystem":"Windows Server 2019 Datacenter","FSMORoles":[null]},{"Name":"vmdc03.azgarlabs.com","IPv4Address":"192.168.224.130","Site":"DataCenter-USEast","IsGlobalCatalog":true,"OperatingSystem":"Windows Server 2019 Standard Evaluation","FSMORoles":[null]},{"Name":"WIN2022-DC04.azgarlabs.com","IPv4Address":"192.168.224.132","Site":"Default-First-Site-Name","IsGlobalCatalog":true,"OperatingSystem":"Windows Server 2022 Standard Evaluation","FSMORoles":[null]}]</script>
-<script id="dc-inventory-data" type="application/json">[{"ComputerName":"vmdc01.azgarlabs.com","Reachable":true,"Error":null,"Hardware":{"SerialNumber":"VMware-56 4d dc c8 29 a3 4b 4d-62 20 0e 96 09 17 e6 27","ProcessorName":"12th Gen Intel(R) Core(TM) i5-12450H","NumberOfLogicalProcessors":2,"Manufacturer":"VMware, Inc.","MachineType":"Virtual Machine","NumberOfProcessors":2,"BIOSVersion":"VMW201.00V.24866131.B64.2507211911","Model":"VMware20,1","TotalMemoryGB":2,"NumberOfCores":2},"System":{"BuildNumber":"17763","Caption":"Microsoft Windows Server 2019 Datacenter","PendingRebootReasons":"","Version":"10.0.17763","PendingReboot":false,"UptimeReadable":"0d 0h 44m","LastBootTime":"13-Jun-2026 21:06:58","UptimeDays":0},"Performance":{"CPUUtilizationPercent":1.5,"MemoryUsedGB":1.66,"MemoryTotalGB":2,"MemoryFreeGB":0.34,"MemoryUtilizationPercent":82.9},"Disks":[{"Label":"","FreeGB":28.57,"Role":"Operating System + NTDS Database + NTDS Logs + SYSVOL","SizeGB":59.4,"Drive":"C:","UsedPercent":51.9}],"Services":[{"StartType":"Automatic","Status":"Running","Name":"NTDS","DisplayName":"Active Directory Domain Services"},{"StartType":"Automatic","Status":"Running","Name":"Netlogon","DisplayName":"Netlogon"},{"StartType":"Automatic","Status":"Running","Name":"Kdc","DisplayName":"Kerberos Key Distribution Center"},{"StartType":"Automatic","Status":"Running","Name":"DNS","DisplayName":"DNS Server"},{"StartType":"Automatic","Status":"Running","Name":"W32Time","DisplayName":"Windows Time"},{"StartType":"Automatic","Status":"Running","Name":"DFSR","DisplayName":"DFS Replication"},{"StartType":"Automatic","Status":"Running","Name":"ADWS","DisplayName":"Active Directory Web Services"}],"TimeSync":{"Stratum":"1 (primary reference - syncd by radio clock)","PhaseOffset":"","LastSyncTime":"6/13/2026 9:07:27 PM","Source":"Local CMOS Clock","Status":"Warning"},"LDAPS":{"CertSubject":"N/A","CertExpiry":"N/A","DaysToExpiry":"N/A","PortOpen":false,"Status":"Unknown","CertIssuer":"N/A"},"Network":[{"DNSServers":"192.168.224.128, 192.168.224.129, 192.168.224.2","AdapterName":"Ethernet0","IPAddress":"192.168.224.128"}],"EthernetSettings":{"IPv4Address":"192.168.224.128","IPv6Address":null,"AdapterName":"Ethernet0","IPv4Enabled":true,"IPv6Enabled":false,"AlternateDNS":"192.168.224.129","PreferredDNS":"192.168.224.128"},"SecurityPosture":{"SMB":{"SigningRequired":true,"SigningEnabled":true,"SMB1Enabled":false},"AuditPolicy":{"DirectoryServiceChanges":"No Auditing","CredentialValidation":"Success","AuthorizationPolicyChange":"No Auditing"},"LDAPSigning":{"LDAPServerIntegrity":1,"LdapEnforceChannelBinding":null},"NetBIOS":{"Adapters":[{"Setting":"Enabled","Adapter":"Intel(R) 82574L Gigabit Network Connection"}]},"NTLM":{"AuditNTLMInDomain":null,"AuditReceivingNTLM":null,"RestrictSendingNTLM":null,"LmCompatibilityLevel":null},"TLS":[{"Protocol":"SSL 2.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"SSL 3.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.1","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.2","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.3","DisabledByDefault":null,"Enabled":null}],"Hotfixes":[{"Description":"Security Update","InstalledOn":"14-Feb-2026","HotFixID":"KB5075903"},{"Description":"Security Update","InstalledOn":"14-Feb-2026","HotFixID":"KB5075904"},{"Description":"Security Update","InstalledOn":"01-Feb-2026","HotFixID":"KB5074222"},{"Description":"Update","InstalledOn":"22-Nov-2025","HotFixID":"KB5066137"},{"Description":"Update","InstalledOn":"22-Nov-2025","HotFixID":"KB4486153"}]},"DeepInsights":{"RecentLogons":[],"SharesHealth":{"NETLOGON":{"Status":"Shared","Path":"C:\\Windows\\SYSVOL\\sysvol\\azgarlabs.com\\SCRIPTS"},"SYSVOL":{"Status":"Shared","Path":"C:\\Windows\\SYSVOL\\sysvol"}},"DNSHealth":{"SRVRecordCount":8,"SRVRecordRegistered":true,"SelfResolvable":true},"DCDiag":{"Advertising":"Passed","SysVolCheck":"Passed","NetLogons":"Passed","Replications":"Passed","FsmoCheck":"Passed","KnowsOfRoleHolders":"Passed","Connectivity":"Passed","Services":"Passed"},"EventLogs":{"DirectoryService":{},"DNSServer":[{"EventID":4015,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server has encountered a critical error from the Active Directory. Check that the Active Directory is functioning properly. The extended error debug information (which may be empty) is \"\". The...","Time":"13-Jun-2026 20:05:47"},{"EventID":408,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server could not open socket for address 192.168.224.128. ","Time":"25-Feb-2026 21:20:47"},{"EventID":404,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server could not bind a Transmission Control Protocol (TCP) socket to address 192.168.224.128. The event data is the error code.  An IP address of 0.0.0.0 can indicate a valid \"any address\" co...","Time":"25-Feb-2026 21:20:47"},{"EventID":408,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server could not open socket for address 192.168.224.128. ","Time":"25-Feb-2026 21:20:47"},{"EventID":407,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server could not bind a User Datagram Protocol (UDP) socket to 192.168.224.128. The event data is the error code. Restart the DNS server or reboot your computer.","Time":"25-Feb-2026 21:20:47"}],"DFSReplication":[{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 21:11:18"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 21:07:30"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 21:02:18"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 20:55:18"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 20:44:06"}]},"DFSRBacklog":[{"State":"Normal","ReplicationGroupName":"Domain System Volume","ReplicatedFolderName":"SYSVOL Share"}]},"Replication":[{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"WIN2022-DC04","PartnerSite":"Default-First-Site-Name","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:35:43","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"WIN2022-DC04","PartnerSite":"Default-First-Site-Name","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:17:00","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"WIN2022-DC04","PartnerSite":"Default-First-Site-Name","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"WIN2022-DC04","PartnerSite":"Default-First-Site-Name","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:13:22","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:07:46","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"WIN2022-DC04","PartnerSite":"Default-First-Site-Name","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:13:19","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"}],"ADBackup":{"LastBackupTime":null,"DaysSinceBackup":null,"Status":"Unknown"}},{"ComputerName":"vmdc02.azgarlabs.com","Reachable":true,"Error":null,"Hardware":{"SerialNumber":"VMware-56 4d 48 43 45 e7 3c 2a-59 fa 43 c0 00 9f a1 6b","ProcessorName":"12th Gen Intel(R) Core(TM) i5-12450H","NumberOfLogicalProcessors":2,"Manufacturer":"VMware, Inc.","MachineType":"Virtual Machine","NumberOfProcessors":2,"BIOSVersion":"VMW201.00V.24866131.B64.2507211911","Model":"VMware20,1","TotalMemoryGB":4,"NumberOfCores":2},"System":{"BuildNumber":"17763","Caption":"Microsoft Windows Server 2019 Datacenter","PendingRebootReasons":"","Version":"10.0.17763","PendingReboot":false,"UptimeReadable":"0d 10h 17m","LastBootTime":"13-Jun-2026 11:33:52","UptimeDays":0},"Performance":{"CPUUtilizationPercent":1,"MemoryUsedGB":2.3,"MemoryTotalGB":4,"MemoryFreeGB":1.69,"MemoryUtilizationPercent":57.6},"Disks":[{"Label":"","FreeGB":37.25,"Role":"Operating System + NTDS Database + NTDS Logs + SYSVOL","SizeGB":59.4,"Drive":"C:","UsedPercent":37.3}],"Services":[{"StartType":"Automatic","Status":"Running","Name":"NTDS","DisplayName":"Active Directory Domain Services"},{"StartType":"Automatic","Status":"Running","Name":"Netlogon","DisplayName":"Netlogon"},{"StartType":"Automatic","Status":"Running","Name":"Kdc","DisplayName":"Kerberos Key Distribution Center"},{"StartType":"Automatic","Status":"Running","Name":"DNS","DisplayName":"DNS Server"},{"StartType":"Automatic","Status":"Running","Name":"W32Time","DisplayName":"Windows Time"},{"StartType":"Automatic","Status":"Running","Name":"DFSR","DisplayName":"DFS Replication"},{"StartType":"Automatic","Status":"Running","Name":"ADWS","DisplayName":"Active Directory Web Services"}],"TimeSync":{"Stratum":"2 (secondary reference - syncd by (S)NTP)","PhaseOffset":"","LastSyncTime":"6/13/2026 9:35:32 PM","Source":"vmdc01.azgarlabs.com","Status":"OK"},"LDAPS":{"CertSubject":"N/A","CertExpiry":"N/A","DaysToExpiry":"N/A","PortOpen":false,"Status":"Unknown","CertIssuer":"N/A"},"Network":[{"DNSServers":"192.168.224.128, 192.168.224.129, 192.168.224.2","AdapterName":"Ethernet0","IPAddress":"192.168.224.129"}],"EthernetSettings":{"IPv4Address":"192.168.224.129","IPv6Address":null,"AdapterName":"Ethernet0","IPv4Enabled":true,"IPv6Enabled":false,"AlternateDNS":"192.168.224.129","PreferredDNS":"192.168.224.128"},"SecurityPosture":{"SMB":{"SigningRequired":true,"SigningEnabled":true,"SMB1Enabled":false},"AuditPolicy":{"DirectoryServiceChanges":"No Auditing","CredentialValidation":"Success","AuthorizationPolicyChange":"No Auditing"},"LDAPSigning":{"LDAPServerIntegrity":1,"LdapEnforceChannelBinding":null},"NetBIOS":{"Adapters":[{"Setting":"Default (via DHCP)","Adapter":"Intel(R) 82574L Gigabit Network Connection"}]},"NTLM":{"AuditNTLMInDomain":null,"AuditReceivingNTLM":null,"RestrictSendingNTLM":null,"LmCompatibilityLevel":null},"TLS":[{"Protocol":"SSL 2.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"SSL 3.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.1","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.2","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.3","DisabledByDefault":null,"Enabled":null}],"Hotfixes":[{"Description":"Security Update","InstalledOn":"26-Feb-2026","HotFixID":"KB5075903"},{"Description":"Security Update","InstalledOn":"26-Feb-2026","HotFixID":"KB5075904"},{"Description":"Security Update","InstalledOn":"02-Feb-2026","HotFixID":"KB5074222"},{"Description":"Security Update","InstalledOn":"23-Nov-2025","HotFixID":"KB5070248"},{"Description":"Update","InstalledOn":"23-Nov-2025","HotFixID":"KB4589208"}]},"DeepInsights":{"RecentLogons":[],"SharesHealth":{"NETLOGON":{"Status":"Shared","Path":"C:\\Windows\\SYSVOL\\sysvol\\azgarlabs.com\\SCRIPTS"},"SYSVOL":{"Status":"Shared","Path":"C:\\Windows\\SYSVOL\\sysvol"}},"DNSHealth":{"SRVRecordCount":8,"SRVRecordRegistered":true,"SelfResolvable":true},"DCDiag":{"Advertising":"Passed","SysVolCheck":"Passed","NetLogons":"Passed","Replications":"Passed","FsmoCheck":"Passed","KnowsOfRoleHolders":"Passed","Connectivity":"Passed","Services":"Passed"},"EventLogs":{"DirectoryService":[{"EventID":2921,"Source":"Microsoft-Windows-ActiveDirectory_DomainService","Message":"The Knowledge Consistency Checker (KCC) detected that the following object have missing required attributes or attribute values. ","Time":"13-Jun-2026 17:03:02"},{"EventID":2002,"Source":"Microsoft-Windows-ActiveDirectory_DomainService","Message":"The Knowledge Consistency Checker (KCC) has detected problems because the attribute on the following object did not have enough values. ","Time":"13-Jun-2026 17:03:02"},{"EventID":2921,"Source":"Microsoft-Windows-ActiveDirectory_DomainService","Message":"The Knowledge Consistency Checker (KCC) detected that the following object have missing required attributes or attribute values. ","Time":"13-Jun-2026 16:56:11"},{"EventID":2002,"Source":"Microsoft-Windows-ActiveDirectory_DomainService","Message":"The Knowledge Consistency Checker (KCC) has detected problems because the attribute on the following object did not have enough values. ","Time":"13-Jun-2026 16:56:11"},{"EventID":1863,"Source":"Microsoft-Windows-ActiveDirectory_DomainService","Message":"This is the replication status for the following directory partition on this directory server. ","Time":"29-Dec-2025 10:15:12"}],"DNSServer":[{"EventID":4001,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server was unable to open zone kiafinance.com in the Active Directory. This DNS server is configured to obtain and use information from the directory for this zone and is unable to load the zo...","Time":"13-Jun-2026 11:34:45"},{"EventID":4001,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server was unable to open zone kiaconcept.com in the Active Directory. This DNS server is configured to obtain and use information from the directory for this zone and is unable to load the zo...","Time":"13-Jun-2026 11:34:45"},{"EventID":4001,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server was unable to open zone hmfusa.com in the Active Directory. This DNS server is configured to obtain and use information from the directory for this zone and is unable to load the zone w...","Time":"13-Jun-2026 11:34:45"},{"EventID":4015,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server has encountered a critical error from the Active Directory. Check that the Active Directory is functioning properly. The extended error debug information (which may be empty) is \"\". The...","Time":"23-Mar-2026 15:57:09"},{"EventID":4015,"Source":"Microsoft-Windows-DNS-Server-Service","Message":"The DNS server has encountered a critical error from the Active Directory. Check that the Active Directory is functioning properly. The extended error debug information (which may be empty) is \"\". The...","Time":"23-Mar-2026 15:29:41"}],"DFSReplication":[{"EventID":5002,"Source":"DFSR","Message":"The DFS Replication service encountered an error communicating with partner VMDC01 for replication group Domain System Volume. ","Time":"13-Jun-2026 20:06:20"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 70 days, which is longe...","Time":"13-Jun-2026 17:37:21"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 69 days, which is longe...","Time":"13-Jun-2026 13:37:21"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 69 days, which is longe...","Time":"13-Jun-2026 12:05:21"},{"EventID":4012,"Source":"DFSR","Message":"The DFS Replication service stopped replication on the folder with the following local path: C:\\Windows\\SYSVOL\\domain. This server has been disconnected from other partners for 69 days, which is longe...","Time":"13-Jun-2026 11:41:21"}]},"DFSRBacklog":[{"State":"Normal","ReplicationGroupName":"Domain System Volume","ReplicatedFolderName":"SYSVOL Share"}]},"Replication":[{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:04:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC03","PartnerSite":"DataCenter-USEast","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:49:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:04:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC03","PartnerSite":"DataCenter-USEast","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:49:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:04:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC03","PartnerSite":"DataCenter-USEast","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:49:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:04:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC03","PartnerSite":"DataCenter-USEast","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:49:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:04:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC03","PartnerSite":"DataCenter-USEast","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:49:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"}],"ADBackup":{"LastBackupTime":null,"DaysSinceBackup":null,"Status":"Unknown"}},{"ComputerName":"vmdc03.azgarlabs.com","Reachable":true,"Error":null,"Hardware":{"SerialNumber":"VMware-56 4d 38 a3 62 c2 02 1d-bc e3 c9 1b 22 d9 87 fc","ProcessorName":"12th Gen Intel(R) Core(TM) i5-12450H","NumberOfLogicalProcessors":2,"Manufacturer":"VMware, Inc.","MachineType":"Virtual Machine","NumberOfProcessors":2,"BIOSVersion":"VMW201.00V.24866131.B64.2507211911","Model":"VMware20,1","TotalMemoryGB":4,"NumberOfCores":2},"System":{"BuildNumber":"17763","Caption":"Microsoft Windows Server 2019 Standard Evaluation","PendingRebootReasons":"","Version":"10.0.17763","PendingReboot":false,"UptimeReadable":"0d 5h 26m","LastBootTime":"13-Jun-2026 16:24:47","UptimeDays":0},"Performance":{"CPUUtilizationPercent":0.5,"MemoryUsedGB":1.5,"MemoryTotalGB":4,"MemoryFreeGB":2.5,"MemoryUtilizationPercent":37.5},"Disks":[{"Label":"","FreeGB":48.44,"Role":"Operating System","SizeGB":59.4,"Drive":"C:","UsedPercent":18.5},{"Label":"New Volume","FreeGB":19.32,"Role":"NTDS Database + NTDS Logs + SYSVOL","SizeGB":19.98,"Drive":"D:","UsedPercent":3.3}],"Services":[{"StartType":"Automatic","Status":"Running","Name":"NTDS","DisplayName":"Active Directory Domain Services"},{"StartType":"Automatic","Status":"Running","Name":"Netlogon","DisplayName":"Netlogon"},{"StartType":"Automatic","Status":"Running","Name":"Kdc","DisplayName":"Kerberos Key Distribution Center"},{"StartType":"Automatic","Status":"Running","Name":"DNS","DisplayName":"DNS Server"},{"StartType":"Automatic","Status":"Running","Name":"W32Time","DisplayName":"Windows Time"},{"StartType":"Automatic","Status":"Running","Name":"DFSR","DisplayName":"DFS Replication"},{"StartType":"Automatic","Status":"Running","Name":"ADWS","DisplayName":"Active Directory Web Services"}],"TimeSync":{"Stratum":"2 (secondary reference - syncd by (S)NTP)","PhaseOffset":"","LastSyncTime":"6/13/2026 9:42:46 PM","Source":"vmdc01.azgarlabs.com","Status":"OK"},"LDAPS":{"CertSubject":"N/A","CertExpiry":"N/A","DaysToExpiry":"N/A","PortOpen":false,"Status":"Unknown","CertIssuer":"N/A"},"Network":[{"DNSServers":"192.168.224.128, 192.168.224.130","AdapterName":"Ethernet0","IPAddress":"192.168.224.130"}],"EthernetSettings":{"IPv4Address":"192.168.224.130","IPv6Address":null,"AdapterName":"Ethernet0","IPv4Enabled":true,"IPv6Enabled":false,"AlternateDNS":"192.168.224.130","PreferredDNS":"192.168.224.128"},"SecurityPosture":{"SMB":{"SigningRequired":true,"SigningEnabled":true,"SMB1Enabled":false},"AuditPolicy":{"DirectoryServiceChanges":"No Auditing","CredentialValidation":"Success","AuthorizationPolicyChange":"No Auditing"},"LDAPSigning":{"LDAPServerIntegrity":1,"LdapEnforceChannelBinding":null},"NetBIOS":{"Adapters":[{"Setting":"Disabled","Adapter":"Intel(R) 82574L Gigabit Network Connection"}]},"NTLM":{"AuditNTLMInDomain":null,"AuditReceivingNTLM":null,"RestrictSendingNTLM":null,"LmCompatibilityLevel":null},"TLS":[{"Protocol":"SSL 2.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"SSL 3.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.1","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.2","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.3","DisabledByDefault":null,"Enabled":null}],"Hotfixes":[{"Description":"Security Update","InstalledOn":"05-Nov-2022","HotFixID":"KB5020374"},{"Description":"Security Update","InstalledOn":"05-Nov-2022","HotFixID":"KB5019966"},{"Description":"Update","InstalledOn":"05-Nov-2022","HotFixID":"KB5020627"}]},"DeepInsights":{"RecentLogons":[],"SharesHealth":{"NETLOGON":{"Status":"Shared","Path":"D:\\Windows\\SYSVOL\\sysvol\\azgarlabs.com\\SCRIPTS"},"SYSVOL":{"Status":"Shared","Path":"D:\\Windows\\SYSVOL\\sysvol"}},"DNSHealth":{"SRVRecordCount":8,"SRVRecordRegistered":true,"SelfResolvable":true},"DCDiag":{"Advertising":"Passed","SysVolCheck":"Passed","NetLogons":"Passed","Replications":"Passed","FsmoCheck":"Passed","KnowsOfRoleHolders":"Passed","Connectivity":"Passed","Services":"Passed"},"EventLogs":{"DirectoryService":{},"DNSServer":{},"DFSReplication":[{"EventID":4612,"Source":"DFSR","Message":"The DFS Replication service initialized SYSVOL at local path D:\\Windows\\SYSVOL\\domain and is waiting to perform initial replication. The replicated folder will remain in the initial synchronization st...","Time":"13-Jun-2026 20:49:56"},{"EventID":5002,"Source":"DFSR","Message":"The DFS Replication service encountered an error communicating with partner vmdc01 for replication group Domain System Volume. ","Time":"13-Jun-2026 20:49:56"},{"EventID":4612,"Source":"DFSR","Message":"The DFS Replication service initialized SYSVOL at local path D:\\Windows\\SYSVOL\\domain and is waiting to perform initial replication. The replicated folder will remain in the initial synchronization st...","Time":"13-Jun-2026 20:06:20"},{"EventID":5002,"Source":"DFSR","Message":"The DFS Replication service encountered an error communicating with partner vmdc01 for replication group Domain System Volume. ","Time":"13-Jun-2026 20:06:20"},{"EventID":6104,"Source":"DFSR","Message":"The DFS Replication service failed to register the WMI providers. Replication is disabled until the problem is resolved. ","Time":"13-Jun-2026 16:02:47"}]},"DFSRBacklog":[{"State":"Normal","ReplicationGroupName":"Domain System Volume","ReplicatedFolderName":"SYSVOL Share"}]},"Replication":[{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:29:13","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:55:12","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 20:55:12","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:08:01","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC02","PartnerSite":"DataCenter-USEast","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:08:16","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"}],"ADBackup":{"LastBackupTime":null,"DaysSinceBackup":null,"Status":"Unknown"}},{"ComputerName":"WIN2022-DC04.azgarlabs.com","Reachable":true,"Error":null,"Hardware":{"SerialNumber":"VMware-56 4d b5 2b 7f 8a dc e4-2a 1b 74 46 dc 36 59 39","ProcessorName":"12th Gen Intel(R) Core(TM) i5-12450H","NumberOfLogicalProcessors":2,"Manufacturer":"VMware, Inc.","MachineType":"Virtual Machine","NumberOfProcessors":2,"BIOSVersion":"VMW201.00V.24866131.B64.2507211911","Model":"VMware20,1","TotalMemoryGB":8,"NumberOfCores":2},"System":{"BuildNumber":"20348","Caption":"Microsoft Windows Server 2022 Standard Evaluation","PendingRebootReasons":"","Version":"10.0.20348","PendingReboot":false,"UptimeReadable":"0d 4h 53m","LastBootTime":"13-Jun-2026 16:58:01","UptimeDays":0},"Performance":{"CPUUtilizationPercent":1,"MemoryUsedGB":2.03,"MemoryTotalGB":8,"MemoryFreeGB":5.96,"MemoryUtilizationPercent":25.4},"Disks":[{"Label":"","FreeGB":48.15,"Role":"Operating System","SizeGB":59.37,"Drive":"C:","UsedPercent":18.9},{"Label":"New Volume","FreeGB":19.32,"Role":"NTDS Database + NTDS Logs + SYSVOL","SizeGB":19.98,"Drive":"D:","UsedPercent":3.3}],"Services":[{"StartType":"Automatic","Status":"Running","Name":"NTDS","DisplayName":"Active Directory Domain Services"},{"StartType":"Automatic","Status":"Running","Name":"Netlogon","DisplayName":"Netlogon"},{"StartType":"Automatic","Status":"Running","Name":"Kdc","DisplayName":"Kerberos Key Distribution Center"},{"StartType":"Automatic","Status":"Running","Name":"DNS","DisplayName":"DNS Server"},{"StartType":"Automatic","Status":"Running","Name":"W32Time","DisplayName":"Windows Time"},{"StartType":"Automatic","Status":"Running","Name":"DFSR","DisplayName":"DFS Replication"},{"StartType":"Automatic","Status":"Running","Name":"ADWS","DisplayName":"Active Directory Web Services"}],"TimeSync":{"Stratum":"2 (secondary reference - syncd by (S)NTP)","PhaseOffset":"","LastSyncTime":"6/13/2026 9:44:26 PM","Source":"vmdc01.azgarlabs.com","Status":"OK"},"LDAPS":{"CertSubject":"N/A","CertExpiry":"N/A","DaysToExpiry":"N/A","PortOpen":false,"Status":"Unknown","CertIssuer":"N/A"},"Network":[{"DNSServers":"192.168.224.128, 127.0.0.1","AdapterName":"Ethernet0","IPAddress":"192.168.224.132"}],"EthernetSettings":{"IPv4Address":"192.168.224.132","IPv6Address":null,"AdapterName":"Ethernet0","IPv4Enabled":true,"IPv6Enabled":false,"AlternateDNS":"127.0.0.1","PreferredDNS":"192.168.224.128"},"SecurityPosture":{"SMB":{"SigningRequired":true,"SigningEnabled":true,"SMB1Enabled":false},"AuditPolicy":{"DirectoryServiceChanges":"No Auditing","CredentialValidation":"Success","AuthorizationPolicyChange":"No Auditing"},"LDAPSigning":{"LDAPServerIntegrity":1,"LdapEnforceChannelBinding":null},"NetBIOS":{"Adapters":[{"Setting":"Default (via DHCP)","Adapter":"Intel(R) 82574L Gigabit Network Connection"}]},"NTLM":{"AuditNTLMInDomain":null,"AuditReceivingNTLM":null,"RestrictSendingNTLM":null,"LmCompatibilityLevel":null},"TLS":[{"Protocol":"SSL 2.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"SSL 3.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.0","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.1","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.2","DisabledByDefault":null,"Enabled":null},{"Protocol":"TLS 1.3","DisabledByDefault":null,"Enabled":null}],"Hotfixes":[{"Description":"Update","InstalledOn":"03-Mar-2022","HotFixID":"KB5010523"},{"Description":"Security Update","InstalledOn":"03-Mar-2022","HotFixID":"KB5011497"},{"Description":"Update","InstalledOn":"03-Mar-2022","HotFixID":"KB5008882"}]},"DeepInsights":{"RecentLogons":[],"SharesHealth":{"NETLOGON":{"Status":"Shared","Path":"D:\\Windows\\SYSVOL\\sysvol\\azgarlabs.com\\SCRIPTS"},"SYSVOL":{"Status":"Shared","Path":"D:\\Windows\\SYSVOL\\sysvol"}},"DNSHealth":{"SRVRecordCount":8,"SRVRecordRegistered":true,"SelfResolvable":true},"DCDiag":{"Advertising":"Passed","SysVolCheck":"Passed","NetLogons":"Passed","Replications":"Passed","FsmoCheck":"Passed","KnowsOfRoleHolders":"Passed","Connectivity":"Passed","Services":"Passed"},"EventLogs":{"DirectoryService":{},"DNSServer":{},"DFSReplication":[{"EventID":4612,"Source":"DFSR","Message":"The DFS Replication service initialized SYSVOL at local path D:\\Windows\\SYSVOL\\domain and is waiting to perform initial replication. The replicated folder will remain in the initial synchronization st...","Time":"13-Jun-2026 20:49:56"},{"EventID":5002,"Source":"DFSR","Message":"The DFS Replication service encountered an error communicating with partner vmdc01 for replication group Domain System Volume. ","Time":"13-Jun-2026 20:49:56"},{"EventID":4612,"Source":"DFSR","Message":"The DFS Replication service initialized SYSVOL at local path D:\\Windows\\SYSVOL\\domain and is waiting to perform initial replication. The replicated folder will remain in the initial synchronization st...","Time":"13-Jun-2026 20:06:16"},{"EventID":5002,"Source":"DFSR","Message":"The DFS Replication service encountered an error communicating with partner vmdc01 for replication group Domain System Volume. ","Time":"13-Jun-2026 20:06:16"},{"EventID":6104,"Source":"DFSR","Message":"The DFS Replication service failed to register the WMI providers. Replication is disabled until the problem is resolved. ","Time":"13-Jun-2026 16:52:49"}]},"DFSRBacklog":[{"State":"Normal","ReplicationGroupName":"Domain System Volume","ReplicatedFolderName":"SYSVOL Share"}]},"Replication":[{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:44:41","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:42:31","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"CN=Schema,CN=Configuration,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:22:01","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=DomainDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:22:01","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"},{"Partner":"VMDC01","PartnerSite":"Default-First-Site-Name","Partition":"DC=ForestDnsZones,DC=azgarlabs,DC=com","LastSuccess":"2026-06-13 21:22:01","LastAttempt":"0","ConsecutiveFailures":"0","LastResult":"0"}],"ADBackup":{"LastBackupTime":null,"DaysSinceBackup":null,"Status":"Unknown"}}]</script>
+<script id="dc-list-data" type="application/json">$DCListJson</script>
+<script id="dc-inventory-data" type="application/json">$DCInventoryJson</script>
 
 <script>
 function downloadCsv(fileName, csvContent) {
@@ -1562,17 +2169,17 @@ function downloadCsv(fileName, csvContent) {
     URL.revokeObjectURL(url);
 }
 
-const domainControllersCsv = '"DomainController","IPv4Address","IsGC","OperatingSystem","Site"\n"vmdc01.azgarlabs.com","192.168.224.128","True","Windows Server 2019 Datacenter","Default-First-Site-Name"\n"vmdc02.azgarlabs.com","192.168.224.129","True","Windows Server 2019 Datacenter","DataCenter-USEast"\n"vmdc03.azgarlabs.com","192.168.224.130","True","Windows Server 2019 Standard Evaluation","DataCenter-USEast"\n"WIN2022-DC04.azgarlabs.com","192.168.224.132","True","Windows Server 2022 Standard Evaluation","Default-First-Site-Name"';
-const dcPingCsv = '"DomainController","IPv4Address","Site","ICMPStatus"\n"vmdc01.azgarlabs.com","192.168.224.128","Default-First-Site-Name","Reachable"\n"vmdc02.azgarlabs.com","192.168.224.129","DataCenter-USEast","Reachable"\n"vmdc03.azgarlabs.com","192.168.224.130","DataCenter-USEast","Reachable"\n"WIN2022-DC04.azgarlabs.com","192.168.224.132","Default-First-Site-Name","Reachable"';
-const adSitesCsv = '"Name","Description"\n"DataCenter-USEast",\n"Default-First-Site-Name",';
-const sitesWithNoDCsCsv = '';
-const adSubnetsCsv = '"Name","Site","Location","Description"\n"172.16.0.0/24","No site assigned",,\n"192.168.10.0/24","DataCenter-USEast",,\n"192.168.224.0/24","Default-First-Site-Name",,';
-const dnsZonesCsv = '"ZoneName","ZoneType","IsDsIntegrated","ReplicationScope","DynamicUpdate"\n"_msdcs.azgarlabs.com","Primary","True","Forest","Secure"\n"0.in-addr.arpa","Primary","False","None","None"\n"127.in-addr.arpa","Primary","False","None","None"\n"224.168.192.in-addr.arpa","Primary","True","Domain","Secure"\n"255.in-addr.arpa","Primary","False","None","None"\n"azgarlabs.com","Primary","True","Domain","Secure"\n"azurebuddy.local","Forwarder","False","None",\n"CACHE","Primary","True","Forest","Secure"\n"contoso.com","Primary","True","Forest","Secure"\n"oakcreekes.us","Primary","True","Domain","Secure"\n"startnetwork.in","Primary","True","Domain","Secure"\n"tailspintoy.com","Primary","True","Forest","Secure"\n"TrustAnchors","Primary","True","Forest","None"';
-const gpoCsv = '"DisplayName","Id","Owner","GpoStatus","CreationTime","ModificationTime"\n"Windows OS Baseline","08481f11-7728-4670-b5d2-633b58a77a45","AZGARLABS\\Domain Admins","AllSettingsEnabled","12/23/2025 12:13:00 PM","3/23/2026 4:27:50 PM"\n"Default Domain Policy","31b2f340-016d-11d2-945f-00c04fb984f9","AZGARLABS\\Domain Admins","AllSettingsEnabled","10/30/2025 9:06:27 PM","11/24/2025 8:07:18 AM"\n"Baseline Security Policy","3cea4713-78e1-4989-a218-0bc692b42195","AZGARLABS\\Domain Admins","AllSettingsEnabled","5/18/2026 12:12:11 AM","5/18/2026 12:12:10 AM"\n"Default Domain Controllers Policy","6ac1786c-016f-11d2-945f-00c04fb984f9","AZGARLABS\\Domain Admins","AllSettingsEnabled","10/30/2025 9:06:27 PM","12/29/2025 11:13:12 AM"\n"TestDisableGPO","c9806083-d35c-4b7a-90df-1fd2b7317848","AZGARLABS\\Domain Admins","AllSettingsDisabled","5/18/2026 12:12:22 AM","5/18/2026 12:12:30 AM"';
-const unlinkedGpoCsv = '"DisplayName","Id","Owner","CreationTime","ModificationTime"\n"Baseline Security Policy","3cea4713-78e1-4989-a218-0bc692b42195","AZGARLABS\\Domain Admins","5/18/2026 12:12:11 AM","5/18/2026 12:12:10 AM"\n"TestDisableGPO","c9806083-d35c-4b7a-90df-1fd2b7317848","AZGARLABS\\Domain Admins","5/18/2026 12:12:22 AM","5/18/2026 12:12:30 AM"';
-const domainAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"Administrator",,"azgarlabs.com"\n"433351","John Doe","azgarlabs.com"\n"433786","Michael Jackson","azgarlabs.com"\n"admin-da","admin-da","azgarlabs.com"\n"Test.Account","Test Account","azgarlabs.com"\n"wsadmin","ws admin","azgarlabs.com"\n"serveradmin","srv Admin","azgarlabs.com"\n"admin-qa","qa admin","azgarlabs.com"\n"lab-admin","lab admin","azgarlabs.com"';
-const enterpriseAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"Administrator",,"azgarlabs.com"';
-const schemaAdminsCsv = '"SamAccountName","DisplayName","DomainName"\n"admin-da","admin-da","azgarlabs.com"\n"Administrator",,"azgarlabs.com"';
+const domainControllersCsv = '$DomainControllersCsvJs';
+const dcPingCsv = '$DCPingCsvJs';
+const adSitesCsv = '$ADSitesCsvJs';
+const sitesWithNoDCsCsv = '$SitesWithNoDCsCsvJs';
+const adSubnetsCsv = '$ADSubnetsCsvJs';
+const dnsZonesCsv = '$DnsZonesCsvJs';
+const gpoCsv = '$GpoCsvJs';
+const unlinkedGpoCsv = '$UnlinkedGpoCsvJs';
+const domainAdminsCsv = '$DomainAdminsCsvJs';
+const enterpriseAdminsCsv = '$EnterpriseAdminsCsvJs';
+const schemaAdminsCsv = '$SchemaAdminsCsvJs';
 
 // =====================================================================
 // Tab navigation
@@ -2277,7 +2884,7 @@ function renderSecDetail(name) {
     else if (smbSt === 'warning') {
         smbTip = secTip(
             'SMB signing is not required. Without it, an attacker positioned on the network can tamper with or relay SMB traffic to/from this DC (NTLM relay attacks).',
-            'Enable "Require SMB signing" via Group Policy or Set-SmbServerConfiguration -RequireSecuritySignature True.',
+            'Enable "Require SMB signing" via Group Policy or Set-SmbServerConfiguration -RequireSecuritySignature $true.',
             'https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/active-directory-hardening-series---part-6-%E2%80%93-enforcing-smb-signing/4272168',
             'AD Hardening Series &ndash; Part 6: Enforcing SMB Signing'
         );
@@ -2911,3 +3518,13 @@ if (dcListData.length > 0) {
 
 </body>
 </html>
+"@
+
+$html | Out-File -FilePath $ReportPath -Encoding UTF8
+
+Write-Host ""
+Write-Host "Dashboard generated successfully:" -ForegroundColor Green
+Write-Host $ReportPath -ForegroundColor Yellow
+Write-Host ""
+
+Start-Process $ReportPath
