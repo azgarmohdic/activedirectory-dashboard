@@ -1,0 +1,465 @@
+<html>
+<head>
+<title>Account Lockout Investigator</title>
+<HTA:APPLICATION
+    APPLICATIONNAME="Account Lockout Investigator"
+    SCROLL="no"
+    SINGLEINSTANCE="yes"
+    BORDER="thin"
+    CAPTION="yes"
+    MAXIMIZEBUTTON="no"
+    MINIMIZEBUTTON="yes"
+    WINDOWSTATE="normal"
+    SHOWINTASKBAR="yes"
+/>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, sans-serif;
+    background: #0a1628; color: #e2e8f0;
+    padding: 26px 30px 16px 30px;
+}
+.pg-title { font-size: 20px; font-weight: 700; color: #60a5fa; margin-bottom: 4px; letter-spacing: -0.01em; }
+.pg-sub   { font-size: 11px; color: #475569; margin-bottom: 20px; }
+.pg-sub span { color: #334155; margin: 0 6px; }
+.search-card { background: #0d1f35; border: 1px solid #1e3a5f; border-radius: 9px; padding: 14px 18px; margin-bottom: 14px; }
+table.sr { width: 100%; border-collapse: collapse; }
+table.sr td { vertical-align: middle; padding: 0 8px 0 0; }
+table.sr td:last-child { padding-right: 0; }
+.sr-lbl { font-size: 12px; font-weight: 600; color: #94a3b8; white-space: nowrap; }
+#samInput {
+    width: 100%; background: #0a1628; border: 1px solid #2d4a6e; border-radius: 5px;
+    padding: 7px 12px; color: #f1f5f9; font-size: 13px; font-family: Consolas, 'Courier New', monospace;
+}
+.btn-go  { background: #2563eb; color: #fff; border: none; border-radius: 5px; padding: 8px 18px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.btn-go:hover  { background: #1d4ed8; }
+.btn-go:active { background: #1e40af; }
+.btn-clr { background: #1a2332; color: #94a3b8; border: 1px solid #2d3748; border-radius: 5px; padding: 8px 14px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.btn-clr:hover { background: #2d3748; color: #e2e8f0; }
+.res-label { font-size: 10px; font-weight: 700; color: #334155; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; padding-left: 2px; }
+#resultBox {
+    background: #071122; border: 1px solid #1a3050; border-radius: 8px;
+    padding: 18px 22px; height: 430px; overflow-y: auto; overflow-x: auto;
+    font-family: Consolas, 'Courier New', monospace; font-size: 12px; line-height: 1.75;
+    color: #7fa8d0; white-space: pre;
+}
+.footer-row { margin-top: 8px; font-size: 12px; color: #2d5a8e; }
+.footer-row table { width: 100%; border-collapse: collapse; }
+.footer-row td { vertical-align: middle; }
+.copy-row { text-align: right; margin-top: 6px; margin-bottom: 2px; }
+.btn-copy { background: #1a2d42; color: #7fa8d0; border: 1px solid #2d4a6e; border-radius: 5px; padding: 5px 16px; font-size: 11px; font-family: 'Segoe UI', Tahoma, Geneva, sans-serif; font-weight: 600; cursor: pointer; letter-spacing: 0.04em; }
+.btn-copy:hover  { background: #1e3a5f; color: #a8c8e8; border-color: #3d6a9e; }
+.btn-copy:active { background: #162840; }
+.tool-credit { margin-top: 6px; padding-top: 5px; border-top: 1px solid #0e2035; font-size: 12px; color: #4a7fa8; text-align: right; letter-spacing: 0.03em; }
+</style>
+</head>
+<body>
+
+<div class="pg-title">&#128270; Account Lockout Investigator</div>
+<div class="pg-sub">
+    Searches all Domain Controllers in your AD forest
+    <span>|</span> Event 4740 (Lockout) &amp; 4771 (Kerberos Failure)
+    <span>|</span> Run as Domain Admin or Event Log Reader
+</div>
+
+<div class="search-card">
+    <table class="sr">
+        <tr>
+            <td style="width:1%"><span class="sr-lbl">Enter User SamAccountName :</span></td>
+            <td style="width:100%"><input type="text" id="samInput" placeholder="e.g.  johndoe" /></td>
+            <td style="width:1%"><button class="btn-go" onclick="searchCulprit()">&#128270;&nbsp; Search the Culprit</button></td>
+            <td style="width:1%"><button class="btn-clr" onclick="clearAll()">&#10006;&nbsp; Clear</button></td>
+        </tr>
+    </table>
+</div>
+
+<div class="res-label">Investigation Results</div>
+<div id="resultBox">  Ready -- enter a SamAccountName above and click  Search the Culprit.</div>
+
+<div class="footer-row">
+    <table><tr>
+        <td id="footLeft" style="text-align:left"></td>
+    </tr></table>
+</div>
+<div style="display:table; width:100%; margin-top:6px;">
+    <div style="display:table-cell; vertical-align:middle; text-align:right;">
+        <button class="btn-copy" id="btnCopy" onclick="copyResult()">&#128203;&nbsp;&nbsp; Copy &nbsp;&nbsp;</button>
+    </div>
+</div>
+<div class="tool-credit">&#169; Account Lockout Investigator Tool developed by Azgar Mohammad [433390]</div>
+
+<script language="JScript">
+
+window.onload = function() {
+    try { window.resizeTo(1000, 760); window.moveTo(80, 40); } catch(e) {}
+    document.getElementById('samInput').focus();
+};
+
+// ─── Build PowerShell script ──────────────────────────────────────────────────
+function buildPS(sam, progf, donef) {
+    var lines = [
+        '$Dom     = (Get-ADDomain).DNSRoot',
+        '$Sam     = "' + sam.replace(/"/g,'').replace(/'/g,'').replace(/`/g,'') + '"',
+        '$ProgFile = "' + progf + '"',
+        '$DoneFile = "' + donef + '"',
+        '',
+        '$failureMap = @{',
+        '    "0x6"  = "Bad username"',
+        '    "0xC"  = "Policy restriction"',
+        '    "0x12" = "Acct disabled / locked / expired"',
+        '    "0x17" = "Password expired"',
+        '    "0x18" = "Wrong password"',
+        '    "0x20" = "Ticket expired"',
+        '    "0x25" = "Clock skew > 5 min"',
+        '    "0x37" = "Account restriction"',
+        '}',
+        '',
+        'function PadR($s, $n) {',
+        '    $s = [string]$s',
+        '    if ($s.Length -ge $n) { return $s.Substring(0,$n) }',
+        '    return ($s + (" " * ($n - $s.Length)))',
+        '}',
+        '',
+        '$reportTime = Get-Date -Format "yyyy-MM-dd  HH:mm:ss"',
+        '',
+        'try {',
+        '    $DCList = @(Get-ADDomainController -Filter * | Sort-Object HostName | Select-Object -ExpandProperty HostName)',
+        '} catch {',
+        '    Write-Output ("  ERROR: Could not retrieve DC list. " + $_.Exception.Message)',
+        '    "done" | Out-File $DoneFile -Encoding ASCII -Force',
+        '    exit 1',
+        '}',
+        '',
+        '$totalLockouts   = 0',
+        '$totalKerberos   = 0',
+        '$dcsWithEvents   = @()',
+        '$culpritIPs      = @()',
+        '$culpritMachines = @()',
+        '$allRows         = @()',
+        '$dcErrors        = @()',
+        '',
+        '# Per-DC worker -- runs inside its own runspace, fully self-contained (no closures)',
+        '$dcWorker = {',
+        '    param($DC, $Sam)',
+        '    $failureMap = @{',
+        '        "0x6"  = "Bad username"',
+        '        "0xC"  = "Policy restriction"',
+        '        "0x12" = "Acct disabled / locked / expired"',
+        '        "0x17" = "Password expired"',
+        '        "0x18" = "Wrong password"',
+        '        "0x20" = "Ticket expired"',
+        '        "0x25" = "Clock skew > 5 min"',
+        '        "0x37" = "Account restriction"',
+        '    }',
+        '    $dcShort = $DC.Split(".")[0].ToUpper()',
+        '    $rows = @(); $cMach = @(); $cIP = @()',
+        '    $err40 = ""; $err71 = ""',
+        '    $n40 = 0; $n71 = 0',
+        '',
+        '    try {',
+        '        $raw = Get-WinEvent -ComputerName $DC -FilterHashtable @{ LogName="Security"; Id=4740 } -MaxEvents 500 -ErrorAction Stop',
+        '        foreach ($ev in $raw) {',
+        '            if ($n40 -ge 20) { break }',
+        '            $x = [xml]$ev.ToXml(); $d = $x.Event.EventData.Data',
+        '            $tu = ($d | Where-Object { $_.Name -eq "TargetUserName" })."#text"',
+        '            if ($tu -ieq $Sam) {',
+        '                $src = ($d | Where-Object { $_.Name -eq "CallerComputerName" })."#text"',
+        '                if ([string]::IsNullOrEmpty($src)) { $src = "(not captured)" } else { $cMach += $src }',
+        '                $rows += [PSCustomObject]@{ T=$ev.TimeCreated; Evt="[4740]"; Src=$src; Rsn="ACCOUNT LOCKED OUT"; DC=$dcShort }',
+        '                $n40++',
+        '            }',
+        '        }',
+        '    } catch {',
+        '        if ($_.Exception.Message -notmatch "No events were found") { $err40 = $_.Exception.Message }',
+        '    }',
+        '',
+        '    try {',
+        '        $raw = Get-WinEvent -ComputerName $DC -FilterHashtable @{ LogName="Security"; Id=4771 } -MaxEvents 500 -ErrorAction Stop',
+        '        foreach ($ev in $raw) {',
+        '            if ($n71 -ge 20) { break }',
+        '            $x = [xml]$ev.ToXml(); $d = $x.Event.EventData.Data',
+        '            $tu = ($d | Where-Object { $_.Name -eq "TargetUserName" })."#text"',
+        '            if ($tu -ieq $Sam) {',
+        '                $ip = ($d | Where-Object { $_.Name -eq "IpAddress" })."#text"',
+        '                $st = ($d | Where-Object { $_.Name -eq "Status"    })."#text"',
+        '                if ($ip) { $ip = $ip -replace "^::ffff:",""; $cIP += $ip } else { $ip = "(not captured)" }',
+        '                $fd = if ($failureMap[$st]) { $st + "  " + $failureMap[$st] } elseif ($st) { $st } else { "Unknown" }',
+        '                $rows += [PSCustomObject]@{ T=$ev.TimeCreated; Evt="[4771]"; Src=$ip; Rsn=$fd; DC=$dcShort }',
+        '                $n71++',
+        '            }',
+        '        }',
+        '    } catch {',
+        '        if ($_.Exception.Message -notmatch "No events were found") { $err71 = $_.Exception.Message }',
+        '    }',
+        '',
+        '    [PSCustomObject]@{',
+        '        DC = $dcShort; Rows = $rows; Err40 = $err40; Err71 = $err71',
+        '        CulpritMachines = $cMach; CulpritIPs = $cIP',
+        '        Lockouts = $n40; Kerberos = $n71',
+        '    }',
+        '}',
+        '',
+        '# Fan out across all DCs concurrently -- throttled thread pool, no extra modules needed on PS 5.1',
+        '$throttle     = [Math]::Min(10, [Math]::Max(1, $DCList.Count))',
+        '$dcTimeoutSec = 30   # max seconds to wait on any single DC before giving up on it and moving on',
+        '$pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $throttle)',
+        '$pool.Open()',
+        '$jobs = @()',
+        'foreach ($DC in $DCList) {',
+        '    $inst = [System.Management.Automation.PowerShell]::Create()',
+        '    $inst.RunspacePool = $pool',
+        '    [void]$inst.AddScript($dcWorker).AddArgument($DC).AddArgument($Sam)',
+        '    $jobs += [PSCustomObject]@{ Inst=$inst; Handle=$inst.BeginInvoke(); DC=$DC; Start=(Get-Date); TimedOut=$false }',
+        '}',
+        '',
+        '$totalJobs = $jobs.Count',
+        '$doneCount = 0',
+        'while ($doneCount -lt $totalJobs) {',
+        '    Start-Sleep -Milliseconds 300',
+        '',
+        '    foreach ($j in $jobs) {',
+        '        if (-not $j.TimedOut -and -not $j.Handle.IsCompleted) {',
+        '            $elapsed = ((Get-Date) - $j.Start).TotalSeconds',
+        '            if ($elapsed -ge $dcTimeoutSec) {',
+        '                # DC is unresponsive -- force-stop this one query so it cannot hang the whole run,',
+        '                # frees its runspace slot for the next queued DC, and we record it as a timeout below',
+        '                try { [void]$j.Inst.BeginStop($null, $null) } catch {}',
+        '                $j.TimedOut = $true',
+        '            }',
+        '        }',
+        '    }',
+        '',
+        '    $doneCount = @($jobs | Where-Object { $_.Handle.IsCompleted -or $_.TimedOut }).Count',
+        '    ("  Checking " + $totalJobs + " Domain Controllers in parallel (x" + $throttle + ")  --  " + $doneCount + " of " + $totalJobs + " completed") | Out-File $ProgFile -Encoding ASCII -Force',
+        '}',
+        '',
+        'foreach ($j in $jobs) {',
+        '    if ($j.TimedOut) {',
+        '        $dcErrors += ($j.DC.Split(".")[0].ToUpper() + " : TIMEOUT -- no response within " + $dcTimeoutSec + "s, skipped")',
+        '        try { $j.Inst.Dispose() } catch {}',
+        '        continue',
+        '    }',
+        '',
+        '    $result = $null',
+        '    try {',
+        '        $result = $j.Inst.EndInvoke($j.Handle) | Select-Object -First 1',
+        '    } catch {',
+        '        $dcErrors += ($j.DC.Split(".")[0].ToUpper() + " : " + $_.Exception.Message)',
+        '    }',
+        '    $j.Inst.Dispose()',
+        '    if ($null -eq $result) { continue }',
+        '',
+        '    if ($result.Err40) { $dcErrors += ($result.DC + " [4740]: " + $result.Err40) }',
+        '    if ($result.Err71) { $dcErrors += ($result.DC + " [4771]: " + $result.Err71) }',
+        '',
+        '    if ($result.Rows.Count -gt 0) {',
+        '        $dcsWithEvents   += $result.DC',
+        '        $totalLockouts   += $result.Lockouts',
+        '        $totalKerberos   += $result.Kerberos',
+        '        $allRows         += $result.Rows',
+        '        $culpritMachines += $result.CulpritMachines',
+        '        $culpritIPs      += $result.CulpritIPs',
+        '    }',
+        '}',
+        '',
+        '$pool.Close()',
+        '$pool.Dispose()',
+        '',
+        '$allRows = @($allRows | Sort-Object T -Descending)',
+        '$lockedOnStr = if ($dcsWithEvents.Count -gt 0) { ($dcsWithEvents -join " | ") } else { "None" }',
+        '',
+        '# Print header',
+        'Write-Output ""',
+        'Write-Output ("  " + $Sam + "  --  LOCKOUT INVESTIGATION")',
+        'Write-Output ("  " + ("=" * 95))',
+        'Write-Output ("  " + (PadR "Domain       : $Dom" 46) + "Report Time  : $reportTime")',
+        'Write-Output ("  " + (PadR "DCs Searched : $($DCList.Count)" 46) + "Locked on DC : $lockedOnStr")',
+        'Write-Output ("  " + ("=" * 95))',
+        '',
+        '# Unified event table',
+        'if ($allRows.Count -gt 0) {',
+        '    Write-Output ""',
+        '    Write-Output ("  CONSOLIDATED EVENT TIMELINE  --  " + $totalLockouts + " lockout(s)  |  " + $totalKerberos + " Kerberos failure(s)")',
+        '    Write-Output ("  " + ("-" * 95))',
+        '    Write-Output ("  " + (PadR "#" 4) + (PadR "Event" 9) + (PadR "Time" 12) + (PadR "Source" 26) + (PadR "Failure Reason" 36) + "DC")',
+        '    Write-Output ("  " + ("-" * 95))',
+        '    $ri = 1',
+        '    foreach ($r in $allRows) {',
+        '        $t = $r.T.ToString("HH:mm:ss")',
+        '        Write-Output ("  " + (PadR $ri 4) + (PadR $r.Evt 9) + (PadR $t 12) + (PadR $r.Src 26) + (PadR $r.Rsn 36) + $r.DC)',
+        '        $ri++',
+        '    }',
+        '    Write-Output ("  " + ("-" * 95))',
+        '} else {',
+        '    Write-Output ""',
+        '    Write-Output "  No lockout or Kerberos failure events found for account : $Sam"',
+        '    Write-Output "  Account may not have been locked recently, or events have rolled off the logs."',
+        '}',
+        '',
+        '# Summary',
+        'Write-Output ""',
+        'Write-Output ("  " + ("=" * 95))',
+        'Write-Output "  SUMMARY"',
+        'Write-Output ("  " + ("=" * 95))',
+        'Write-Output ("  " + (PadR "Account" 18) + ": " + $Sam)',
+        'Write-Output ("  " + (PadR "DCs Searched" 18) + ": " + $DCList.Count + "  |  DCs with Events : " + $dcsWithEvents.Count + " (" + $lockedOnStr + ")")',
+        'Write-Output ("  " + (PadR "Total Lockouts" 18) + ": " + $totalLockouts + " event(s)  (Event 4740)")',
+        'Write-Output ("  " + (PadR "Total Kerberos" 18) + ": " + $totalKerberos + " event(s)  (Event 4771)")',
+        'if ($culpritMachines.Count -gt 0) {',
+        '    $uniq = @($culpritMachines | Sort-Object -Unique)',
+        '    Write-Output ("  " + (PadR "Culprit Machine" 18) + ": " + ($uniq -join " | "))',
+        '}',
+        'if ($culpritIPs.Count -gt 0) {',
+        '    $uniq = @($culpritIPs | Sort-Object -Unique)',
+        '    Write-Output ("  " + (PadR "Culprit IP(s)" 18) + ": " + ($uniq -join " | "))',
+        '}',
+        'if ($dcErrors.Count -gt 0) {',
+        '    Write-Output ("  " + (PadR "DC Errors" 18) + ": " + $dcErrors.Count + " DC(s) had access errors -- check permissions")',
+        '    foreach ($de in $dcErrors) { Write-Output ("    [!] " + $de) }',
+        '}',
+        'Write-Output ("  " + ("=" * 95))',
+        '',
+        '# Full DC list at the bottom -- multi-column',
+        'Write-Output ""',
+        'Write-Output "  DCs Checked :"',
+        'Write-Output ("  " + ("-" * 95))',
+        '$maxDCLen = ($DCList | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum',
+        '$colW = [Math]::Max($maxDCLen + 3, 22)',
+        '$perRow = [Math]::Max(1, [Math]::Floor(93 / $colW))',
+        'if ($perRow -gt 4) { $perRow = 4 }',
+        '$ci = 0; $rowStr = "  "',
+        'foreach ($dc in $DCList) {',
+        '    $rowStr += (PadR $dc $colW)',
+        '    $ci++',
+        '    if ($ci % $perRow -eq 0) { Write-Output $rowStr.TrimEnd(); $rowStr = "  " }',
+        '}',
+        'if ($ci % $perRow -ne 0) { Write-Output $rowStr.TrimEnd() }',
+        'Write-Output ("  " + ("-" * 95))',
+        'Write-Output ""',
+        '',
+        '# Signal completion to HTA',
+        '"done" | Out-File $DoneFile -Encoding ASCII -Force'
+    ];
+    return lines.join('\r\n');
+}
+
+// ─── Main search ──────────────────────────────────────────────────────────────
+function searchCulprit() {
+    var sam = document.getElementById('samInput').value.replace(/^\s+|\s+$/g, '');
+    if (!sam) {
+        document.getElementById('resultBox').innerText = '  Please enter a SamAccountName before searching.';
+        return;
+    }
+
+    document.getElementById('resultBox').innerText =
+        '  Discovering Domain Controllers ...\n' +
+        '  Querying Event 4740 + 4771 on each DC -- DCs with no events are skipped.\n\n' +
+        '  Please wait -- this may take 1-5 minutes depending on number of DCs.';
+    document.getElementById('footLeft').innerText = 'Discovering Domain Controllers ...';
+
+    var sh   = new ActiveXObject('WScript.Shell');
+    var fso  = new ActiveXObject('Scripting.FileSystemObject');
+    var ts   = (new Date()).getTime();
+    var tmp  = sh.ExpandEnvironmentStrings('%TEMP%');
+    var psf   = tmp + '\\ALF_' + ts + '.ps1';
+    var outf  = tmp + '\\ALF_' + ts + '.txt';
+    var progf = tmp + '\\ALF_' + ts + '_prog.txt';
+    var donef = tmp + '\\ALF_' + ts + '_done.txt';
+
+    try {
+        var fw = fso.CreateTextFile(psf, true, false);
+        fw.Write(buildPS(sam, progf, donef));
+        fw.Close();
+    } catch (ex) {
+        document.getElementById('resultBox').innerText = '  ERROR writing temp file:\n\n  ' + ex.message;
+        return;
+    }
+
+    // Run PowerShell async (bWaitOnReturn = false)
+    sh.Run('cmd /c powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + psf + '" > "' + outf + '" 2>&1', 0, false);
+
+    var startTime = (new Date()).getTime();
+
+    // Poll every 500ms for progress and completion
+    var pollTimer = window.setInterval(function() {
+        try {
+            // Hard timeout: 15 minutes
+            if ((new Date()).getTime() - startTime > 900000) {
+                window.clearInterval(pollTimer);
+                document.getElementById('footLeft').innerText = 'Timed out after 15 minutes. Check DC connectivity.';
+                return;
+            }
+
+            // Done flag written by PS when script finishes
+            if (fso.FileExists(donef)) {
+                window.clearInterval(pollTimer);
+
+                var out = '';
+                if (fso.FileExists(outf)) {
+                    try {
+                        var fr = fso.OpenTextFile(outf, 1, false, -2);
+                        out = fr.ReadAll(); fr.Close();
+                    } catch(e1) {
+                        try { var fr2 = fso.OpenTextFile(outf, 1, false, 0); out = fr2.ReadAll(); fr2.Close(); } catch(e2) { out = '  Could not read output: ' + e2.message; }
+                    }
+                }
+
+                document.getElementById('resultBox').innerText = out || '  No output returned.';
+                document.getElementById('footLeft').innerText = 'Completed at ' + (new Date()).toLocaleTimeString() + '  |  Account: ' + sam;
+
+                try { if (fso.FileExists(psf))   fso.DeleteFile(psf);   } catch(e) {}
+                try { if (fso.FileExists(outf))  fso.DeleteFile(outf);  } catch(e) {}
+                try { if (fso.FileExists(progf)) fso.DeleteFile(progf); } catch(e) {}
+                try { if (fso.FileExists(donef)) fso.DeleteFile(donef); } catch(e) {}
+
+            } else if (fso.FileExists(progf)) {
+                // Update status with current DC being checked
+                try {
+                    var pf = fso.OpenTextFile(progf, 1, false, 0);
+                    var prog = pf.ReadAll().replace(/[\r\n\s]+$/, '');
+                    pf.Close();
+                    if (prog) document.getElementById('footLeft').innerText = prog;
+                } catch(e) {}
+            }
+        } catch(e) {}
+    }, 500);
+}
+
+// ─── Copy to Clipboard ────────────────────────────────────────────────────────
+function copyResult() {
+    var full = document.getElementById('resultBox').innerText;
+    var cutIdx = full.indexOf('DCs Checked :');
+    var content = (cutIdx !== -1) ? full.substring(0, cutIdx).replace(/[\r\n]+$/, '') : full;
+    if (!content || content.indexOf('Ready --') === 0) {
+        document.getElementById('btnCopy').innerText = '  Nothing to copy';
+        window.setTimeout(function() { document.getElementById('btnCopy').innerHTML = '&#128203;&nbsp;&nbsp; Copy &nbsp;&nbsp;'; }, 1500);
+        return;
+    }
+    try {
+        window.clipboardData.setData('Text', content);
+        document.getElementById('btnCopy').innerHTML = '&#10003;&nbsp; Copied!';
+        window.setTimeout(function() { document.getElementById('btnCopy').innerHTML = '&#128203;&nbsp;&nbsp; Copy &nbsp;&nbsp;'; }, 2000);
+    } catch(e) {
+        document.getElementById('btnCopy').innerText = '  Copy failed: ' + e.message;
+    }
+}
+
+// ─── Clear ────────────────────────────────────────────────────────────────────
+function clearAll() {
+    document.getElementById('samInput').value = '';
+    document.getElementById('resultBox').innerText = '  Ready -- enter a SamAccountName above and click  Search the Culprit.';
+    document.getElementById('footLeft').innerText  = '';
+    document.getElementById('samInput').focus();
+}
+
+document.onkeydown = function(evt) {
+    var e = evt || window.event;
+    if (e.keyCode === 13) {
+        var t = document.activeElement || e.srcElement;
+        if (t && t.id === 'samInput') searchCulprit();
+    }
+};
+
+</script>
+</body>
+</html>
