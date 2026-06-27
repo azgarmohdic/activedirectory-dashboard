@@ -2,8 +2,8 @@ The dashboard was designed more as an Operations + Governance visibility layer r
 
 Built an “Enterprise Active Directory Operational Dashboard” using PowerShell, HTML, CSS, and native AD modules.
 
-# Note: Updated version of Enterprise AD Health Dashboard is available in v2.ps1
-# Copy Get-ADDashboard-v2.ps1 and Get-DCInventory.ps1 both the files in the same folder, run the Get-ADDashboard-v2.ps1 to get the repor
+# Note: Updated version of Enterprise AD Health Dashboard is available in v4.ps1
+# Copy Get-ADDashboard-v4.ps1 and Get-DCInventory.ps1 both the files in the same folder, run the Get-ADDashboard-v4.ps1 to get the repor
 # The script is intended for lab/testing validation first. Review, test, and tune appropriately before using in production environments.
 
 The goal was simple:
