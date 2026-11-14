@@ -1,0 +1,320 @@
+#Requires -Version 5.1
+#Requires -Modules ActiveDirectory
+<#
+.SYNOPSIS
+    Audits machine SID uniqueness for every computer in an AD OU and reports
+    servers that were cloned without Sysprep (duplicate machine SIDs).
+
+.DESCRIPTION
+    The local machine SID is NOT stored in Active Directory, so it has to be read
+    from each server. This script:
+      1. Lists all computer objects in -SearchBase (AD module).
+      2. Connects to all of them in parallel over PowerShell Remoting (WinRM, read-only).
+      3. Collects: hostname, IPv4 address(es), machine SID, OS build (incl. UBR),
+         OS install date, BIOS/VM UUID, and the count of LsaSrv Event ID 6167
+         (raised on Windows Server 2025 when authentication fails because of duplicate SIDs).
+      4. Groups the results by machine SID and flags the duplicates.
+
+    Nothing is written to AD or to the target servers.
+
+    Outputs (written to -OutputFolder):
+      MachineSID_Inventory.csv    - every computer in the OU, including unreachable ones
+      MachineSID_Duplicates.csv   - only servers that share a machine SID, grouped
+      MachineSID_Unreachable.csv  - computers that could not be queried, with the reason
+      MachineSID_Summary.txt      - counts for reporting
+
+.PARAMETER SearchBase
+    Distinguished name of the OU that holds the newly provisioned servers.
+
+.PARAMETER Server
+    Optional: a specific domain controller to query.
+
+.PARAMETER Credential
+    Optional: an account with local admin rights on the target servers.
+
+.PARAMETER ThrottleLimit
+    Maximum number of servers queried at the same time. Default 32.
+
+.PARAMETER EventLookbackDays
+    How many days of System log to search for LsaSrv 6167. Default 30.
+
+.EXAMPLE
+    .\Get-OUMachineSidAudit.ps1 -SearchBase "OU=Servers-2025,OU=Servers,DC=contoso,DC=com"
+
+.EXAMPLE
+    .\Get-OUMachineSidAudit.ps1 -SearchBase "OU=Servers-2025,DC=contoso,DC=com" -Server dc01.contoso.com -Credential (Get-Credential) -ThrottleLimit 64
+
+.NOTES
+    Run this from an admin host that was NOT built from the same image as the targets.
+    Remoting from a host that shares a target's machine SID will fail authentication
+    on Windows Server 2025 (LsaSrv 6167).
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SearchBase,
+
+    [string]$Server,
+
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [ValidateRange(1, 256)]
+    [int]$ThrottleLimit = 32,
+
+    [ValidateRange(1, 365)]
+    [int]$EventLookbackDays = 30,
+
+    [string]$OutputFolder = (Join-Path (Get-Location).Path ("MachineSidAudit_{0:yyyyMMdd_HHmmss}" -f (Get-Date)))
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ------------------------------------------------------------------------------
+# 1. Enumerate computer objects in the OU
+# ------------------------------------------------------------------------------
+$adParams = @{
+    SearchBase  = $SearchBase
+    SearchScope = 'Subtree'
+    Filter      = '*'
+    Properties  = 'DNSHostName', 'IPv4Address', 'OperatingSystem', 'whenCreated', 'Enabled'
+}
+if ($Server) { $adParams['Server'] = $Server }
+
+Write-Host "Querying AD: $SearchBase" -ForegroundColor Cyan
+$adComputers = @(Get-ADComputer @adParams)
+if ($adComputers.Count -eq 0) {
+    Write-Warning "No computer objects found in $SearchBase."
+    return
+}
+Write-Host ("Found {0} computer object(s)." -f $adComputers.Count)
+
+# Prefer the FQDN for Kerberos; fall back to the short name
+$targetMap = @{}   # target name -> AD object
+foreach ($c in $adComputers) {
+    $target = if ($c.DNSHostName) { $c.DNSHostName } else { $c.Name }
+    $targetMap[$target] = $c
+}
+
+# ------------------------------------------------------------------------------
+# 2. Remote collection (read-only)
+# ------------------------------------------------------------------------------
+$remoteScript = {
+    param([int]$LookbackDays)
+
+    $cs  = Get-CimInstance -ClassName Win32_ComputerSystem
+    $os  = Get-CimInstance -ClassName Win32_OperatingSystem
+    $csp = Get-CimInstance -ClassName Win32_ComputerSystemProduct
+    $cv  = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+    # Machine SID: every local SAM account shares the same account-domain SID.
+    # DCs (DomainRole 4/5) have no local SAM, so the value would be the domain SID.
+    if ($cs.DomainRole -ge 4) {
+        $machineSid = 'N/A - Domain Controller'
+    }
+    else {
+        $acct = Get-CimInstance -ClassName Win32_UserAccount `
+                    -Filter "LocalAccount=True AND Domain='$env:COMPUTERNAME'" |
+                Select-Object -First 1
+        $machineSid = if ($acct) {
+            ([System.Security.Principal.SecurityIdentifier]$acct.SID).AccountDomainSid.Value
+        } else {
+            'ERROR - no local accounts found'
+        }
+    }
+
+    $ipv4 = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+              Select-Object -ExpandProperty IPAddress)
+
+    # LsaSrv 6167 = "partial mismatch in the machine ID" (duplicate-SID authentication failure)
+    $evt6167 = @(Get-WinEvent -FilterHashtable @{
+                    LogName      = 'System'
+                    ProviderName = 'LsaSrv'
+                    Id           = 6167
+                    StartTime    = (Get-Date).AddDays(-$LookbackDays)
+                 } -ErrorAction SilentlyContinue).Count
+
+    [pscustomobject]@{
+        Hostname        = $env:COMPUTERNAME
+        HostIPv4        = ($ipv4 -join '; ')
+        MachineSID      = $machineSid
+        OSCaption       = $os.Caption
+        OSBuild         = '{0}.{1}' -f $cv.CurrentBuild, $cv.UBR
+        OSInstallDate   = $os.InstallDate
+        BiosUUID        = $csp.UUID
+        LsaSrv6167Count = $evt6167
+    }
+}
+
+$icParams = @{
+    ComputerName  = [string[]]$targetMap.Keys
+    ScriptBlock   = $remoteScript
+    ArgumentList  = $EventLookbackDays
+    ThrottleLimit = $ThrottleLimit
+    ErrorAction   = 'SilentlyContinue'
+    ErrorVariable = 'remoteErrors'
+}
+if ($Credential) { $icParams['Credential'] = $Credential }
+
+Write-Host ("Collecting from {0} server(s) over WinRM (throttle {1})..." -f $targetMap.Count, $ThrottleLimit) -ForegroundColor Cyan
+$remoteResults = @(Invoke-Command @icParams)
+
+# Index results and errors by the target name used for the connection
+$resultByTarget = @{}
+foreach ($r in $remoteResults) { $resultByTarget[$r.PSComputerName] = $r }
+
+$errorByTarget = @{}
+foreach ($e in $remoteErrors) {
+    $name = $null
+    if ($e.OriginInfo -and $e.OriginInfo.PSComputerName) { $name = $e.OriginInfo.PSComputerName }
+    elseif ($e.TargetObject) { $name = [string]$e.TargetObject }
+    if ($name -and -not $errorByTarget.ContainsKey($name)) {
+        $errorByTarget[$name] = ($e.Exception.Message -replace '\s+', ' ').Trim()
+    }
+}
+
+# ------------------------------------------------------------------------------
+# 3. Merge AD data and remote data
+# ------------------------------------------------------------------------------
+$rows = foreach ($target in $targetMap.Keys) {
+    $ad = $targetMap[$target]
+    $r  = $resultByTarget[$target]
+
+    if ($r) {
+        $status = 'OK'
+    }
+    elseif ($errorByTarget.ContainsKey($target)) {
+        $status = "UNREACHABLE: $($errorByTarget[$target])"
+    }
+    else {
+        $status = 'UNREACHABLE: no response'
+    }
+
+    [pscustomobject]@{
+        Hostname        = if ($r) { $r.Hostname } else { $ad.Name }
+        DNSHostName     = $ad.DNSHostName
+        HostIPv4        = if ($r) { $r.HostIPv4 } else { $null }
+        DnsIPv4         = $ad.IPv4Address
+        MachineSID      = if ($r) { $r.MachineSID } else { $null }
+        DuplicateGroup  = $null
+        SidShareCount   = $null
+        BiosUUID        = if ($r) { $r.BiosUUID } else { $null }
+        UuidShareCount  = $null
+        OSCaption       = if ($r) { $r.OSCaption } else { $ad.OperatingSystem }
+        OSBuild         = if ($r) { $r.OSBuild } else { $null }
+        OSInstallDate   = if ($r) { $r.OSInstallDate } else { $null }
+        LsaSrv6167Count = if ($r) { $r.LsaSrv6167Count } else { $null }
+        ADEnabled       = $ad.Enabled
+        ADWhenCreated   = $ad.whenCreated
+        DistinguishedName = $ad.DistinguishedName
+        Status          = $status
+    }
+}
+$rows = @($rows)
+
+# ------------------------------------------------------------------------------
+# 4. Duplicate detection
+# ------------------------------------------------------------------------------
+$validSidRows = @($rows | Where-Object { $_.MachineSID -match '^S-1-5-21-\d+-\d+-\d+$' })
+
+$dupGroups = @($validSidRows | Group-Object -Property MachineSID |
+               Where-Object { $_.Count -gt 1 } |
+               Sort-Object -Property Count -Descending)
+
+$i = 0
+foreach ($g in $dupGroups) {
+    $i++
+    $groupId = 'DUP-{0:D3}' -f $i
+    foreach ($row in $g.Group) {
+        $row.DuplicateGroup = $groupId
+        $row.SidShareCount  = $g.Count
+    }
+}
+foreach ($row in $validSidRows) {
+    if (-not $row.DuplicateGroup) { $row.SidShareCount = 1 }
+}
+
+# Duplicate BIOS/VM UUIDs are a second sign of cloning (VM copied with its identity)
+$uuidGroups = @($rows | Where-Object { $_.BiosUUID } | Group-Object -Property BiosUUID)
+foreach ($g in $uuidGroups) {
+    foreach ($row in $g.Group) { $row.UuidShareCount = $g.Count }
+}
+
+# ------------------------------------------------------------------------------
+# 5. Output
+# ------------------------------------------------------------------------------
+New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+
+$inventoryCsv   = Join-Path $OutputFolder 'MachineSID_Inventory.csv'
+$duplicatesCsv  = Join-Path $OutputFolder 'MachineSID_Duplicates.csv'
+$unreachableCsv = Join-Path $OutputFolder 'MachineSID_Unreachable.csv'
+$summaryTxt     = Join-Path $OutputFolder 'MachineSID_Summary.txt'
+
+$rows | Sort-Object DuplicateGroup, MachineSID, Hostname |
+    Export-Csv -Path $inventoryCsv -NoTypeInformation -Encoding UTF8
+
+$dupRows = @($rows | Where-Object { $_.DuplicateGroup } | Sort-Object DuplicateGroup, Hostname)
+$dupRows | Select-Object DuplicateGroup, SidShareCount, MachineSID, Hostname, HostIPv4,
+                         OSBuild, OSInstallDate, BiosUUID, UuidShareCount, LsaSrv6167Count, DistinguishedName |
+    Export-Csv -Path $duplicatesCsv -NoTypeInformation -Encoding UTF8
+
+$unreachable = @($rows | Where-Object { $_.Status -ne 'OK' })
+$unreachable | Select-Object Hostname, DNSHostName, DnsIPv4, ADEnabled, ADWhenCreated, Status, DistinguishedName |
+    Export-Csv -Path $unreachableCsv -NoTypeInformation -Encoding UTF8
+
+$serversInDupGroups = $dupRows.Count
+$minToRebuild       = ($dupGroups | ForEach-Object { $_.Count - 1 } | Measure-Object -Sum).Sum
+if (-not $minToRebuild) { $minToRebuild = 0 }
+$with6167           = @($rows | Where-Object { $_.LsaSrv6167Count -gt 0 }).Count
+$sidErrors          = @($rows | Where-Object { $_.Status -eq 'OK' -and $_.MachineSID -notmatch '^S-1-5-21-\d+-\d+-\d+$' }).Count
+$uuidDupServers     = @($rows | Where-Object { $_.UuidShareCount -gt 1 }).Count
+
+$summary = @"
+Machine SID Uniqueness Audit
+============================
+Run time                 : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Run by                   : $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME
+Scope (OU)               : $SearchBase
+
+Computer objects in OU   : $($rows.Count)
+Successfully queried     : $(@($rows | Where-Object Status -eq 'OK').Count)
+Unreachable              : $($unreachable.Count)
+Queried, SID not usable  : $sidErrors   (DCs or errors - see Inventory)
+
+Unique machine SIDs      : $(@($validSidRows | Select-Object -ExpandProperty MachineSID -Unique).Count)
+Duplicate SID groups     : $($dupGroups.Count)
+Servers sharing a SID    : $serversInDupGroups   (all of these were cloned without Sysprep)
+Minimum to rebuild       : $minToRebuild   (one per group may keep its SID; others must be made unique)
+Servers sharing BIOS UUID: $uuidDupServers
+Servers with LsaSrv 6167 : $with6167   (last $EventLookbackDays days)
+
+Duplicate groups:
+$(
+    if ($dupGroups.Count -eq 0) { '  None found in scope.' }
+    else {
+        ($dupGroups | ForEach-Object {
+            $gid = $_.Group[0].DuplicateGroup
+            "  {0}  {1}  ({2} servers): {3}" -f $gid, $_.Name, $_.Count, (($_.Group.Hostname | Sort-Object) -join ', ')
+        }) -join [Environment]::NewLine
+    }
+)
+
+Files:
+  $inventoryCsv
+  $duplicatesCsv
+  $unreachableCsv
+"@
+
+$summary | Out-File -FilePath $summaryTxt -Encoding UTF8
+Write-Host ''
+Write-Host $summary
+if ($dupGroups.Count -gt 0) {
+    Write-Host ("RESULT: {0} server(s) in {1} duplicate-SID group(s)." -f $serversInDupGroups, $dupGroups.Count) -ForegroundColor Red
+}
+else {
+    Write-Host 'RESULT: No duplicate machine SIDs found among reachable servers.' -ForegroundColor Green
+}
+if ($unreachable.Count -gt 0) {
+    Write-Host ("WARNING: {0} server(s) could not be queried. The result is incomplete until they are checked." -f $unreachable.Count) -ForegroundColor Yellow
+}
