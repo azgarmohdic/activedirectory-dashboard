@@ -1,0 +1,38 @@
+mayank sharma
+12:08 PM
+505 git config --global user.name "xxxxx"
+506 git config --global user.email "xxxxxx@gmail.com"
+507 git config --list
+508 git --help
+509 git help -a
+510 touch demo.txty
+511 mv demo.txty demo.txt
+512 ls
+513 vim demo.txt
+514 ls
+515 git status
+516 ls -al
+517 git add .
+518 git status
+519 git commit -m "first file"
+520 git status
+521 git log
+522 git branch -m main
+523 git remote add origin https://github.com/maysharma123/mygithubrepo.git
+524 git config --list
+525 git status
+526 git log --oneline
+527 git show a78871f
+528 git push origin main
+529 touch demo1.txt
+530 ls
+531 git add t
+532 git add demo1.txt
+533 git status
+534 vim demo
+535 vim demo1
+536 vim demo1.txt
+537 git add .
+538 git commit -m "this is second file"
+539 git push origin main
+540 history
